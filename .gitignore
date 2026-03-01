@@ -9,3 +9,9 @@ node_modules/
 temp_*
 
 scripts/
+
+reports/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/

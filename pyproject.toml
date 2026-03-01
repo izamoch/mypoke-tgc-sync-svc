@@ -1,0 +1,42 @@
+[project]
+name = "mypoke_tgc_sync"
+version = "0.1.0"
+description = "Sync Pokémon TCG data to local database"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = [
+    "E",  # pycodestyle errors
+    "W",  # pycodestyle warnings
+    "F",  # pyflakes
+    "I",  # isort
+    "C",  # flake8-comprehensions
+    "B",  # flake8-bugbear
+]
+ignore = [
+    "E501",  # line too long, letting ruff formatter handle this
+]
+
+[tool.mypy]
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false  # You can set this to true later as you add more types
+check_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# Ignore missing typing stubs for specific libraries
+module = [
+    "imagehash.*",
+    "sqlalchemy.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+python_files = "test_*.py"

@@ -115,7 +115,7 @@ def maintain_price_history(db: Session, card_id: str, variant: str):
             db.delete(record)
         # We don't commit here to allow caller to bulk commit
 
-async def sync_sets_and_cards(db: Session, card_limit: int = None):
+async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
     """
     Incremental Sync:
     1. Fetch Sets -> Insert NEW sets only.
@@ -139,6 +139,12 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None):
             # Optimization: Fetch all existing Set IDs
             existing_set_ids = {s.id for s in db.query(models.Set.id).all()}
             
+            metrics = {
+                "new_sets": 0,
+                "new_cards": 0,
+                "cards_processed": 0,
+                "errors": []
+            }
             new_sets_count = 0
             for s in sets_data:
                 if s['id'] not in existing_set_ids:
@@ -158,6 +164,7 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None):
 
         except Exception as e:
             errors.append(f"Sets sync error: {str(e)}")
+            metrics["errors"].append(f"Sets sync error: {str(e)}")
             db.rollback()
 
         # --- 2. CARDS ---
@@ -177,6 +184,7 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None):
                 new_cards_summary = new_cards_summary[:card_limit]
             
             log.cards_processed = len(new_cards_summary)
+            metrics["cards_processed"] = len(new_cards_summary)
             print(f"Found {len(new_cards_summary)} new cards to process.")
             
             for card_summary in new_cards_summary:
@@ -209,6 +217,7 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None):
                     )
                     db.add(new_card)
                     log.cards_added += 1
+                    metrics["new_cards"] += 1
                     
                     # Initial Price (Optional: can be handled by sync_prices, but nice to have initialized)
                     # We skip it here to strictly separate logic: sync_prices will pick it up because it has no price.
@@ -222,10 +231,12 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None):
                     
                 except Exception as e:
                     errors.append(f"Card {card_summary['id']} error: {str(e)}")
+                    metrics["errors"].append(f"Card {card_summary['id']} error: {str(e)}")
                     db.rollback()
                     
         except Exception as e:
             errors.append(f"Cards list sync error: {str(e)}")
+            metrics["errors"].append(f"Cards list sync error: {str(e)}")
 
     log.status = 'success' if not errors else 'error'
     log.error_details = "\n".join(errors[-50:]) if errors else None # Limit error log size
@@ -233,8 +244,11 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None):
     log.finished_at = datetime.datetime.utcnow()
     db.commit()
     print("Sets/Cards Sync Finished.")
+    
+    metrics["new_sets"] = new_sets_count
+    return metrics
 
-async def sync_prices(db: Session):
+async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     """
     Updates prices for cards based on Temperature/Hashing strategy.
     """
@@ -377,6 +391,17 @@ async def sync_prices(db: Session):
     else:
         print("No errors encountered.")
     print("="*40 + "\n")
+    
+    return {
+        "total_cards": len(all_cards),
+        "checked_count": checked_count,
+        "scheduled_for_check": total_to_check,
+        "updated_count": updated_count,
+        "strategy_breakdown": strat_stats,
+        "variant_updates": stats['variant_updates'],
+        "errors_by_type": stats['errors_by_type'],
+        "error_list": errors
+    }
 
 async def update_card_price(db: Session, card_id: str, variant: str, vals: dict, log: models.SyncLog) -> bool:
     """

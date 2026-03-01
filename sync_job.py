@@ -1,17 +1,17 @@
+import argparse
 import asyncio
 import logging
-import sys
-import argparse
-from datetime import datetime
-import json
 import os
+import sys
+from datetime import datetime
+
+import httpx
+
+import sync
 
 # Import database and sync modules
 # Import database and sync modules
 from database import SessionLocal
-import sync
-import models
-import httpx
 
 # Configure logging
 logging.basicConfig(
@@ -59,6 +59,16 @@ def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dic
                 report_desc += f"- **{etype}:** {count}\n"
     else:
         report_desc += "*(Failed or Skipped)*\n"
+
+    # Save report locally
+    report_filename = f"reports/sync_report_{start_time.strftime('%Y%m%d_%H%M%S')}.md"
+    os.makedirs("reports", exist_ok=True)
+    try:
+        with open(report_filename, "w", encoding="utf-8") as f:
+            f.write(report_desc)
+        logger.info(f"Local report saved to {report_filename}")
+    except Exception as e:
+        logger.error(f"Failed to save local report: {e}")
 
     # Check if we should send a webhook
     webhook_url = os.getenv("REPORT_WEBHOOK_URL")

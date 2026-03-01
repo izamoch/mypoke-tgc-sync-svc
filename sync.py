@@ -26,7 +26,11 @@ def determine_check_strategy(card: models.Card) -> str:
     """
     now = datetime.datetime.utcnow()
 
-    # 0. Never checked? -> IMMEDIATE
+    # 0. Missing Critical Enrichment? -> FORCE CHECK
+    if not card.flavor_text:
+        return "ENRICH"
+
+    # 1. Never checked? -> IMMEDIATE
     if not card.last_price_check_at:
         return "NEW"
 
@@ -242,7 +246,7 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     # Filter cards to check
     # AND gather strat stats
     cards_to_check = []
-    strat_stats = {"NEW": 0, "HOT": 0, "STABLE": 0, "STABLE_SAFETY": 0, "COLD": 0, "COLD_SAFETY": 0}
+    strat_stats = {"NEW": 0, "HOT": 0, "STABLE": 0, "STABLE_SAFETY": 0, "COLD": 0, "COLD_SAFETY": 0, "ENRICH": 0}
 
     for c in all_cards:
         strat = determine_check_strategy(c)
@@ -255,7 +259,7 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
 
     print(f"Total Cards: {len(all_cards)}. Scheduled for check: {total_to_check}")
     print(
-        f"Breakdown: HOT={strat_stats['HOT']}, STABLE={strat_stats['STABLE']}, COLD={strat_stats['COLD']}, NEW={strat_stats['NEW']}"
+        f"Breakdown: ENRICH={strat_stats['ENRICH']}, HOT={strat_stats['HOT']}, STABLE={strat_stats['STABLE']}, COLD={strat_stats['COLD']}, NEW={strat_stats['NEW']}"
     )
 
     updated_count = 0

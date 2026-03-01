@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 import models
 from utils.phash import calculate_phash
+from pokeapi_client import fetch_pokeapi_data
 
 TCGDEX_API = "https://api.tcgdex.net/v2/en"
 
@@ -72,24 +73,6 @@ def start_sync_flag():
     SHOULD_STOP = False
 
 
-def maintain_price_history(db: Session, card_id: str, variant: str):
-    """
-    Retention Policy:
-    - Last 7 days: 1 record per day.
-    - 7-30 days: 2 records per week (approx every 3.5 days).
-    - 30-365 days: 2 records per month (approx every 15 days).
-    - Older: 1 record per month.
-    """
-    now = datetime.datetime.utcnow()
-    # Fetch all history for this variant, ordered by time DESC
-    history = (
-        db.query(models.CardPriceHistory)
-        .filter(models.CardPriceHistory.card_id == card_id, models.CardPriceHistory.price_type == variant)
-        .order_by(models.CardPriceHistory.timestamp.desc())
-        .all()
-    )
-
-    seen_buckets = set()
     to_delete = []
 
     for record in history:
@@ -159,6 +142,7 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
                         if isinstance(s.get("cardCount"), dict)
                         else s.get("cardCount"),
                         image_url=f"{s.get('logo')}.png" if s.get("logo") else None,
+                        release_date=s.get("releaseDate"),
                     )
                     db.add(new_set)
                     new_sets_count += 1
@@ -222,6 +206,19 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
                         set_id=details["set"]["id"],
                         image_url=image_url_low,
                         phash=phash,
+                        # Expanded Metadata
+                        rarity=details.get("rarity"),
+                        category=details.get("category"),
+                        illustrator=details.get("illustrator"),
+                        hp=details.get("hp"),
+                        types=json.dumps(details.get("types")) if details.get("types") else None,
+                        stage=details.get("stage"),
+                        suffix=details.get("suffix"),
+                        attacks=json.dumps(details.get("attacks")) if details.get("attacks") else None,
+                        weaknesses=json.dumps(details.get("weaknesses")) if details.get("weaknesses") else None,
+                        retreat=details.get("retreat"),
+                        regulation_mark=details.get("regulationMark"),
+                        legal=json.dumps(details.get("legal")) if details.get("legal") else None,
                         # updated_at defaults to now
                     )
                     db.add(new_card)
@@ -346,21 +343,70 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
                     continue
 
                 prices_found = {}
+                
+                # 1. TCGPlayer (Main Prices)
                 if "tcgplayer" in pricing:
                     for variant, p_data in pricing["tcgplayer"].items():
                         if not isinstance(p_data, dict):
                             continue
 
-                        market_p = p_data.get("marketPrice") or p_data.get("midPrice") or 0.0
+                        market_p = p_data.get("marketPrice") or 0.0
                         low_p = p_data.get("lowPrice") or 0.0
+                        mid_p = p_data.get("midPrice") or 0.0
                         high_p = p_data.get("highPrice") or 0.0
+                        direct_p = p_data.get("directLowPrice") or 0.0
 
-                        if market_p > 0 or low_p > 0 or high_p > 0:
-                            prices_found[variant] = {"market": market_p, "low": low_p, "high": high_p}
+                        if any([market_p, low_p, mid_p, high_p, direct_p]):
+                            prices_found[variant] = {
+                                "market": market_p, 
+                                "low": low_p, 
+                                "mid": mid_p,
+                                "high": high_p,
+                                "direct": direct_p,
+                                "avg": 0.0,
+                                "trend": 0.0,
+                                "trend_1d": 0.0,
+                                "trend_7d": 0.0,
+                                "trend_30d": 0.0
+                            }
+
+                # 2. Cardmarket Trends
+                if "cardmarket" in pricing:
+                    cm = pricing["cardmarket"]
+                    for variant, cm_data in cm.items():
+                        if not isinstance(cm_data, dict):
+                            continue
+                        
+                        if variant in prices_found:
+                            prices_found[variant]["avg"] = cm_data.get("avg") or 0.0
+                            prices_found[variant]["trend"] = cm_data.get("trend") or 0.0
+                            prices_found[variant]["trend_1d"] = cm_data.get("avg1") or 0.0
+                            prices_found[variant]["trend_7d"] = cm_data.get("avg7") or 0.0
+                            prices_found[variant]["trend_30d"] = cm_data.get("avg30") or 0.0
+                            # Cardmarket low if low_p was empty
+                            if prices_found[variant]["low"] == 0.0:
+                                prices_found[variant]["low"] = cm_data.get("low") or 0.0
 
                 card_updated = False
+                
+                # 3. Lore Enrichment (PokéAPI) - Once per unique Dex ID
+                if card.dex_id and not card.flavor_text:
+                    # Basic memoization per sync run
+                    if "enriched_dex_ids" not in stats:
+                        stats["enriched_dex_ids"] = set()
+                    
+                    if card.dex_id not in stats["enriched_dex_ids"]:
+                        print(f"Enriching Dex ID {card.dex_id} from PokéAPI...")
+                        flavor, evos = await fetch_pokeapi_data(card.dex_id)
+                        if flavor:
+                            card.flavor_text = flavor
+                            card.evolutions = json.dumps(evos)
+                            card_updated = True
+                            stats["enriched_dex_ids"].add(card.dex_id)
+                            stats["metadata_enriched"] = stats.get("metadata_enriched", 0) + 1
+
                 for variant, p_vals in prices_found.items():
-                    changed = await update_card_price(db, card.id, variant, p_vals, log)
+                    changed = await update_card_price(db, card.id, variant, p_vals, log, details=details)
                     if changed:
                         card_updated = True
                         stats["variant_updates"][variant] = stats["variant_updates"].get(variant, 0) + 1
@@ -421,16 +467,51 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     }
 
 
-async def update_card_price(db: Session, card_id: str, variant: str, vals: dict, log: models.SyncLog) -> bool:
+async def update_card_price(db: Session, card_id: str, variant: str, vals: dict, log: models.SyncLog, details: dict = None) -> bool:
     """
     Returns True if ANY price (Market, Low, High) changed significantly (> 0.01).
-    This ensures the App Delta Sync picks up these changes.
+    Also updates the main Card metadata if 'details' is provided (backfill).
     """
-    market = vals["market"]
-    low = vals["low"]
-    high = vals["high"]
+    market = vals.get("market", 0.0)
+    low = vals.get("low", 0.0)
+    mid = vals.get("mid", 0.0)
+    high = vals.get("high", 0.0)
+    direct = vals.get("direct", 0.0)
+    avg = vals.get("avg", 0.0)
+    trend = vals.get("trend", 0.0)
+    
+    # Trend extraction (defaults to 0.0 if not present)
+    t1 = vals.get("trend_1d", 0.0)
+    t7 = vals.get("trend_7d", 0.0)
+    t30 = vals.get("trend_30d", 0.0)
 
-    # Check existing
+    # 1. Update Card Metadata (Incremental Backfill)
+    if details:
+        card = db.query(models.Card).filter(models.Card.id == card_id).first()
+        if card:
+            # Basic Metadata
+            if not card.rarity:
+                card.rarity = details.get("rarity")
+                card.category = details.get("category")
+                card.illustrator = details.get("illustrator")
+                card.hp = details.get("hp")
+                card.types = json.dumps(details.get("types")) if details.get("types") else None
+                card.stage = details.get("stage")
+                card.suffix = details.get("suffix")
+                card.attacks = json.dumps(details.get("attacks")) if details.get("attacks") else None
+                card.weaknesses = json.dumps(details.get("weaknesses")) if details.get("weaknesses") else None
+                card.retreat = details.get("retreat")
+                card.regulation_mark = details.get("regulationMark")
+                card.legal = json.dumps(details.get("legal")) if details.get("legal") else None
+            
+            # Additional Discovery (dexId)
+            if not card.dex_id:
+                # TCGDex often provides a list of Dex numbers
+                dex_ids = details.get("dexId", [])
+                if dex_ids and isinstance(dex_ids, list):
+                    card.dex_id = dex_ids[0]
+
+    # 2. Update Price
     current = (
         db.query(models.CardPrice)
         .filter(models.CardPrice.card_id == card_id, models.CardPrice.price_type == variant)
@@ -441,79 +522,44 @@ async def update_card_price(db: Session, card_id: str, variant: str, vals: dict,
 
     if not current:
         # New Price Record
-        new_p = models.CardPrice(card_id=card_id, price_type=variant, value=market, low=low, high=high)
+        new_p = models.CardPrice(
+            card_id=card_id, 
+            price_type=variant, 
+            market=market, 
+            low=low, 
+            mid=mid,
+            high=high,
+            direct=direct,
+            avg=avg,
+            trend=trend,
+            trend_1d=t1,
+            trend_7d=t7,
+            trend_30d=t30
+        )
         db.add(new_p)
         any_changed = True
-
-        # Insert History for new record
-        hist = models.CardPriceHistory(
-            card_id=card_id, price_type=variant, value=market, timestamp=datetime.datetime.utcnow()
-        )
-        db.add(hist)
     else:
-        # Detect Changes
-        market_diff = abs(current.value - market) > 0.01
-        low_diff = abs((current.low or 0) - low) > 0.01
-        high_diff = abs((current.high or 0) - high) > 0.01
+        # Detect Changes (Primary on market)
+        market_diff = abs(current.market - market) > 0.01
+        
+        # Update all fields
+        current.market = market
+        current.low = low
+        current.mid = mid
+        current.high = high
+        current.direct = direct
+        current.avg = avg
+        current.trend = trend
+        current.trend_1d = t1
+        current.trend_7d = t7
+        current.trend_30d = t30
 
-        if market_diff or low_diff or high_diff:
+        if market_diff:
             any_changed = True
-
-            # Log significant changes if market changed (historically we tracked market)
-            if market_diff:
-                db.add(
-                    models.ChangeLog(
-                        card_id=card_id, change_type="price", old_value=str(current.value), new_value=str(market)
-                    )
+            db.add(
+                models.ChangeLog(
+                    card_id=card_id, change_type="price", old_value=str(current.market), new_value=str(market)
                 )
-
-            # Update Current Values
-            current.value = market
-            current.low = low
-            current.high = high
-
-            # History Logic (Driven by Market Price mainly, but we insert if market changed)
-            if market_diff:
-                hist = models.CardPriceHistory(
-                    card_id=card_id, price_type=variant, value=market, timestamp=datetime.datetime.utcnow()
-                )
-                db.add(hist)
-                maintain_price_history(db, card_id, variant)
-            else:
-                # STABLE MARKET PRICE LOGIC (Flat Line Optimization)
-                # Even if Low/High changed, if Market is flat, we optimize the history graph.
-                # See previous logic: extend 'tail' record.
-
-                last_history = (
-                    db.query(models.CardPriceHistory)
-                    .filter(models.CardPriceHistory.card_id == card_id, models.CardPriceHistory.price_type == variant)
-                    .order_by(models.CardPriceHistory.timestamp.desc())
-                    .limit(2)
-                    .all()
-                )
-
-                should_insert = False
-                should_update_tail = False
-
-                if not last_history:
-                    should_insert = True
-                elif abs(last_history[0].value - market) > 0.01:
-                    should_insert = True
-                else:
-                    if len(last_history) > 1 and abs(last_history[1].value - market) < 0.01:
-                        should_update_tail = True
-                    else:
-                        should_insert = True
-
-                if should_insert:
-                    # Only insert if we really need to (e.g. gap filling), but here likely checking if we should add a node
-                    # because Low changed? No, History tracks Market Value.
-                    # If Market is stable, we just extend tail.
-                    hist = models.CardPriceHistory(
-                        card_id=card_id, price_type=variant, value=market, timestamp=datetime.datetime.utcnow()
-                    )
-                    db.add(hist)
-                elif should_update_tail:
-                    last_history[0].timestamp = datetime.datetime.utcnow()
+            )
 
     return any_changed

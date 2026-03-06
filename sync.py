@@ -395,21 +395,8 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
                         card.dex_id = dex_ids[0]
                         card_updated = True
                 
-                # 3. Lore Enrichment (PokéAPI) - Once per unique Dex ID
-                if card.dex_id and not card.flavor_text:
-                    # Basic memoization per sync run
-                    if "enriched_dex_ids" not in stats:
-                        stats["enriched_dex_ids"] = set()
-                    
-                    if card.dex_id not in stats["enriched_dex_ids"]:
-                        print(f"Enriching Dex ID {card.dex_id} from PokéAPI...")
-                        flavor, evos = await fetch_pokeapi_data(card.dex_id)
-                        if flavor:
-                            card.flavor_text = flavor
-                            card.evolutions = json.dumps(evos)
-                            card_updated = True
-                            stats["enriched_dex_ids"].add(card.dex_id)
-                            stats["metadata_enriched"] = stats.get("metadata_enriched", 0) + 1
+                # PokéAPI Lore Enrichment logic removed as per user request to only update prices.
+
 
                 for variant, p_vals in prices_found.items():
                     changed = await update_card_price(db, card.id, variant, p_vals, log, details=details)

@@ -451,15 +451,18 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
                     metadata_updated = True
 
                 prices_changed = False
+                significant_price_change = False
                 for variant, p_vals in prices_found.items():
-                    changed = await update_card_price(db, card.id, variant, p_vals, log)
+                    changed, sig = await update_card_price(db, card.id, variant, p_vals, log)
                     if changed:
                         prices_changed = True
                         stats["variant_updates"][variant] = stats["variant_updates"].get(variant, 0) + 1
+                    if sig:
+                        significant_price_change = True
 
-                if metadata_updated:
-                    # Update metadata ONLY if structural info changed. Price changes SHOULD NOT
-                    # update this timestamp so that cards can cool down and become STABLE.
+                if metadata_updated or significant_price_change:
+                    # Update metadata/temperature ONLY if there's structural info change
+                    # or a SIGNIFICANT price swing. Minor jitters SHOULD NOT update this timestamp.
                     card.updated_at = datetime.datetime.utcnow()
                     
                 if metadata_updated or prices_changed:
@@ -518,9 +521,10 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     }
 
 
-async def update_card_price(db: Session, card_id: str, variant: str, vals: dict, log: models.SyncLog) -> bool:
+async def update_card_price(db: Session, card_id: str, variant: str, vals: dict, log: models.SyncLog) -> tuple[bool, bool]:
     """
-    Returns True if ANY price changed significantly (> 0.01) or if a new price was recorded.
+    Returns (any_changed, is_significant).
+    True if ANY price changed significantly (> 0.01), and a second boolean for major price swings (> 5% or > $0.50).
     """
     market = vals.get("market", 0.0)
     low = vals.get("low", 0.0)
@@ -543,6 +547,7 @@ async def update_card_price(db: Session, card_id: str, variant: str, vals: dict,
     )
 
     any_changed = False
+    is_significant = False
 
     if not current:
         # New Price Record
@@ -562,9 +567,21 @@ async def update_card_price(db: Session, card_id: str, variant: str, vals: dict,
         )
         db.add(new_p)
         any_changed = True
+        is_significant = True
     else:
         # Detect Changes (Primary on market)
-        market_diff = abs(current.market - market) > 0.01
+        market_diff = abs(current.market - market)
+        
+        if market_diff > 0.01:
+            any_changed = True
+            
+            # Is the change significant enough to restart the temperature? (> 5% or flat > $0.50)
+            if current.market and current.market > 0:
+                percent_change = market_diff / current.market
+                if percent_change >= 0.05 or market_diff >= 0.50:
+                    is_significant = True
+            elif market_diff >= 0.50:
+                is_significant = True
         
         # Update all fields
         current.market = market
@@ -578,12 +595,11 @@ async def update_card_price(db: Session, card_id: str, variant: str, vals: dict,
         current.trend_7d = t7
         current.trend_30d = t30
 
-        if market_diff:
-            any_changed = True
+        if any_changed:
             db.add(
                 models.ChangeLog(
                     card_id=card_id, change_type="price", old_value=str(current.market), new_value=str(market)
                 )
             )
 
-    return any_changed
+    return any_changed, is_significant

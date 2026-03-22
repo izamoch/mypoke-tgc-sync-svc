@@ -5,7 +5,7 @@ Incremental synchronization engine for Pokémon TCG data, aligned with TCGDex AP
 ## 🚀 Key Features
 - **Granular Pricing**: Full support for TCGPlayer (`market`, `low`, `mid`, `high`, `direct`) and Cardmarket (`avg`, `trend`, and 1d/7d/30d temporal averages).
 - **Lore Enrichment**: Automatic backfill of Pokédex flavor text and evolution chains using PokéAPI.
-- **Smart Sync Strategy**: Temperature-based hashing strategy to prioritize "Hot" (recent) cards while maintaining "Stable" and "Cold" archives.
+- **Smart Sync Strategy**: Hybrid value-tier + hash rotation — Premium cards (≥$20) checked daily, Standard ($0-$20) via `hash % 5` (~every 5 days), and cards without price data via `hash % 15` (~every 15 days). Safety nets ensure no card goes unchecked indefinitely.
 - **Supabase Integration**: Native support for PostgreSQL/Supabase with optimized indexes for mobile search.
 - **Auto-Reporting**: Local and webhook-based markdown reports after every sync run.
 

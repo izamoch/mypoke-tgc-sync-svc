@@ -18,10 +18,14 @@ TCGDEX_API = "https://api.tcgdex.net/v2/en"
 SHOULD_STOP = False
 
 
-def determine_check_strategy(card: models.Card) -> str:
+def determine_check_strategy(card: models.Card, max_market_price: float = 0.0) -> str:
     """
     Determines WHY a card is checked (or skipped).
-    Returns: 'HOT', 'STABLE', 'COLD' if checked.
+    Uses a hybrid value-tier + hash rotation strategy:
+      - PREMIUM (market >= $20): checked daily
+      - STANDARD (market $0-$20): checked via hash % 5 (~every 5 days)
+      - NO_PRICE (no price data): checked via hash % 15 (~every 15 days)
+    Returns: 'PREMIUM', 'STANDARD', 'NO_PRICE', 'NEW' if checked.
     Returns: 'SKIP' if skipped.
     """
     now = datetime.datetime.utcnow()
@@ -32,35 +36,28 @@ def determine_check_strategy(card: models.Card) -> str:
 
     # Use total_seconds to get fractional days instead of integer flooring
     last_check_days = (now - card.last_price_check_at).total_seconds() / 86400.0
-    last_update_days = (now - card.updated_at).days
-
-    # 1. HOT
-    if last_update_days < 7:
-        # Check if approx 1 day has passed (allow up to 4 hours early for daily crons -> ~0.83 days)
-        return "HOT" if last_check_days >= 0.83 else "SKIP"
-
     card_hash = int(hashlib.sha256(card.id.encode("utf-8")).hexdigest(), 16)
     day_of_year = now.timetuple().tm_yday
 
-    # 2. STABLE
-    if last_update_days < 30:
-        if last_check_days > 10:
-            return "STABLE_SAFETY"
-        if (card_hash % 7) == (day_of_year % 7):
-            return "STABLE"
-        return "SKIP"
+    # 2. PREMIUM: daily check (allow ~20h window for cron flexibility)
+    if max_market_price >= 20.0:
+        return "PREMIUM" if last_check_days >= 0.83 else "SKIP"
 
-    # 3. COLD
-    if last_check_days > 45:
-        return "COLD_SAFETY"
-    if (card_hash % 30) == (day_of_year % 30):
-        return "COLD"
-    return "SKIP"
+    # 3. NO_PRICE: rotate hash % 15 (~every 15 days)
+    if max_market_price == 0.0:
+        if last_check_days > 20:
+            return "NO_PRICE_SAFETY"
+        return "NO_PRICE" if (card_hash % 15) == (day_of_year % 15) else "SKIP"
+
+    # 4. STANDARD: rotate hash % 5 (~every 5 days)
+    if last_check_days > 8:
+        return "STANDARD_SAFETY"
+    return "STANDARD" if (card_hash % 5) == (day_of_year % 5) else "SKIP"
 
 
-def should_check_price(card: models.Card) -> bool:
-    # Legacy wrapper if needed, but we will assume sync_prices uses determine_check_strategy now
-    return determine_check_strategy(card) != "SKIP"
+def should_check_price(card: models.Card, max_market_price: float = 0.0) -> bool:
+    # Legacy wrapper
+    return determine_check_strategy(card, max_market_price) != "SKIP"
 
 
 def stop_sync():
@@ -270,27 +267,37 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     total_cards = db.query(models.Card.id).count()
 
     # Pre-flight to get strategy stats and the subset of IDs that need updating
-    # We fetch only the necessary columns to keep memory low.
+    # We fetch card columns + max market price via subquery to classify tiers.
     card_ids_to_check = []
-    strat_stats = {"NEW": 0, "HOT": 0, "STABLE": 0, "STABLE_SAFETY": 0, "COLD": 0, "COLD_SAFETY": 0, "ENRICH": 0}
+    strat_stats = {"NEW": 0, "PREMIUM": 0, "STANDARD": 0, "STANDARD_SAFETY": 0, "NO_PRICE": 0, "NO_PRICE_SAFETY": 0}
 
-    # Column-limited query for performance
-    query = db.query(
-        models.Card.id, 
-        models.Card.last_price_check_at, 
-        models.Card.updated_at, 
-        models.Card.flavor_text
+    # Subquery: max market price per card (excluding legacy stale variants)
+    from sqlalchemy import func, case
+    max_price_subq = (
+        db.query(
+            models.CardPrice.card_id,
+            func.max(models.CardPrice.market).label("max_market")
+        )
+        .filter(models.CardPrice.price_type.notin_(["holo", "reverse", "firstEdition"]))
+        .group_by(models.CardPrice.card_id)
+        .subquery()
     )
 
-    for cid, last_check, updated, flavor in query.all():
-        # Temporary card to reuse existing strategy logic
-        temp_card = models.Card(
-            id=cid, 
-            last_price_check_at=last_check, 
-            updated_at=updated, 
-            flavor_text=flavor
+    query = (
+        db.query(
+            models.Card.id,
+            models.Card.last_price_check_at,
+            func.coalesce(max_price_subq.c.max_market, 0.0).label("max_market")
         )
-        strat = determine_check_strategy(temp_card)
+        .outerjoin(max_price_subq, models.Card.id == max_price_subq.c.card_id)
+    )
+
+    for cid, last_check, max_market in query.all():
+        temp_card = models.Card(
+            id=cid,
+            last_price_check_at=last_check,
+        )
+        strat = determine_check_strategy(temp_card, float(max_market or 0.0))
         if force_prices or strat != "SKIP":
             card_ids_to_check.append(cid)
             strat_stats[strat] = strat_stats.get(strat, 0) + 1
@@ -300,7 +307,7 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
 
     print(f"Total Cards: {total_cards}. Scheduled for check: {total_to_check}")
     print(
-        f"Breakdown: ENRICH={strat_stats['ENRICH']}, HOT={strat_stats['HOT']}, STABLE={strat_stats['STABLE']}, COLD={strat_stats['COLD']}, NEW={strat_stats['NEW']}"
+        f"Breakdown: PREMIUM={strat_stats['PREMIUM']}, STANDARD={strat_stats['STANDARD']}, NO_PRICE={strat_stats['NO_PRICE']}, NEW={strat_stats['NEW']}"
     )
 
     updated_count = 0
@@ -460,9 +467,9 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
                     if sig:
                         significant_price_change = True
 
-                if metadata_updated or significant_price_change:
-                    # Update metadata/temperature ONLY if there's structural info change
-                    # or a SIGNIFICANT price swing. Minor jitters SHOULD NOT update this timestamp.
+                if metadata_updated:
+                    # Update card timestamp ONLY for structural metadata changes.
+                    # Price changes no longer affect this timestamp (tier strategy is value-based).
                     card.updated_at = datetime.datetime.utcnow()
                     
                 if metadata_updated or prices_changed:

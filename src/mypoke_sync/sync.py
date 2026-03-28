@@ -232,6 +232,7 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     """
     Updates prices for cards based on Temperature/Hashing strategy.
     """
+    start_time = datetime.datetime.utcnow()
     print(f"[{start_time}] Starting Price Sync (Smart Strategy)...")
     errors = []
 

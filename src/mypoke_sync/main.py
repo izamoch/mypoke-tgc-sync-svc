@@ -5,6 +5,7 @@ import os
 import sys
 from datetime import datetime
 
+import httpx
 from . import sync
 from .export import run_sqlite_export
 from .database import SessionLocal, DATABASE_URL

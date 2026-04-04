@@ -5,6 +5,8 @@ services:
     container_name: poke_sync_job
     env_file:
       - .env
+    environment:
+      - PYTHONUNBUFFERED=1
     volumes:
       - ./data:/app/data
       - ./reports:/app/reports

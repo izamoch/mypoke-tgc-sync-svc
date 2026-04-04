@@ -78,11 +78,9 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
     1. Fetch Sets -> Insert NEW sets only.
     2. Fetch Cards List -> Filter against DB -> Insert NEW cards only (calculating pHash).
     """
-    start_time = datetime.datetime.utcnow()
-
-    print(f"[{start_time}] Starting Incremental Sets/Cards Sync...")
-    errors = []
-
+    metrics = {"new_sets": 0, "new_cards": 0, "cards_processed": 0, "errors": []}
+    new_sets_count = 0
+    
     async with httpx.AsyncClient() as client:
         # --- 1. SETS ---
         try:
@@ -95,8 +93,6 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
             for s in db.query(models.Set.id).yield_per(1000):
                 existing_set_ids.add(s[0])
 
-            metrics = {"new_sets": 0, "new_cards": 0, "cards_processed": 0, "errors": []}
-            new_sets_count = 0
             for s in sets_data:
                 if s["id"] not in existing_set_ids:
                     new_set = models.Set(
@@ -282,13 +278,13 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     print(
         f"Breakdown: PREMIUM={strat_stats['PREMIUM']}, STANDARD={strat_stats['STANDARD']}, NO_PRICE={strat_stats['NO_PRICE']}, NEW={strat_stats['NEW']}"
     )
-
+    # Batch size for processing and committing
+    BATCH_SIZE = 50
     updated_count = 0
     checked_count = 0
 
     # Detailed Stats
     stats = {
-        "delta_triggers": 0,
         "variant_updates": {},  # e.g. "normal": 5, "reverseHolofoil": 2
         "errors_by_type": {},
     }
@@ -298,158 +294,145 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     async with httpx.AsyncClient() as client:
-        # Instead of looping over card objects, we loop over the IDs we filtered, and query them when needed
-        for i, cid in enumerate(card_ids_to_check, 1):
+        # Process in chunks of BATCH_SIZE
+        for i in range(0, total_to_check, BATCH_SIZE):
             if SHOULD_STOP:
                 print("Sync stopping explicitly (Prices loop).")
                 break
                 
-            card = db.query(models.Card).filter(models.Card.id == cid).first()
-            if not card:
-                continue
+            chunk_ids = card_ids_to_check[i : i + BATCH_SIZE]
+            # Fetch all card objects for this chunk in ONE query
+            cards_chunk = db.query(models.Card).filter(models.Card.id.in_(chunk_ids)).all()
+            # Map them by ID for easy access
+            cards_by_id = {c.id: c for c in cards_chunk}
 
-            checked_count += 1
+            for cid in chunk_ids:
+                card = cards_by_id.get(cid)
+                if not card:
+                    continue
 
-            # Progress Log (every 100 cards or 5%)
-            if i % 100 == 0 or i == total_to_check:
-                percent = (i / total_to_check) * 100
-                print(
-                    f"[{datetime.datetime.utcnow().strftime('%H:%M:%S')}] Progress: {i}/{total_to_check} ({percent:.1f}%) - Updates: {updated_count}"
-                )
+                checked_count += 1
+                try:
+                    # Random sleep to prevent API saturation
+                    await asyncio.sleep(random.uniform(0.1, 0.4))
 
-            try:
-                # Random sleep to prevent API saturation
-                await asyncio.sleep(random.uniform(0.2, 0.7))
+                    response = await client.get(f"{TCGDEX_API}/cards/{card.id}")
+                    if response.status_code == 404:
+                        card.updated_at = datetime.datetime.utcnow()
+                        continue
 
-                response = await client.get(f"{TCGDEX_API}/cards/{card.id}")
-                if response.status_code == 404:
+                    response.raise_for_status()
+                    details = response.json()
+
                     card.updated_at = datetime.datetime.utcnow()
-                    db.commit()
-                    continue
 
-                # Just to be safe if raise_for_status is needed, but we catch generic exception
-                response.raise_for_status()
-                details = response.json()
+                    pricing = details.get("pricing")
+                    if not pricing or not isinstance(pricing, dict):
+                        continue
 
-                card.updated_at = datetime.datetime.utcnow()
+                    prices_found = {}
+                    
+                    # 1. TCGPlayer (Main Prices)
+                    tcg_pricing = pricing.get("tcgplayer")
+                    if tcg_pricing and isinstance(tcg_pricing, dict):
+                        for variant, p_data in tcg_pricing.items():
+                            if not isinstance(p_data, dict):
+                                continue
 
-                pricing = details.get("pricing")
-                if not pricing or not isinstance(pricing, dict):
-                    db.commit()
-                    continue
+                            market_p = p_data.get("marketPrice") or 0.0
+                            low_p = p_data.get("lowPrice") or 0.0
+                            mid_p = p_data.get("midPrice") or 0.0
+                            high_p = p_data.get("highPrice") or 0.0
+                            direct_p = p_data.get("directLowPrice") or 0.0
 
-                prices_found = {}
-                
-                # 1. TCGPlayer (Main Prices)
-                tcg_pricing = pricing.get("tcgplayer")
-                if tcg_pricing and isinstance(tcg_pricing, dict):
-                    for variant, p_data in tcg_pricing.items():
-                        if not isinstance(p_data, dict):
-                            continue
+                            if any([market_p, low_p, mid_p, high_p, direct_p]):
+                                prices_found[variant] = {
+                                    "market": market_p, 
+                                    "low": low_p, 
+                                    "mid": mid_p,
+                                    "high": high_p,
+                                    "direct": direct_p,
+                                    "avg": 0.0,
+                                    "trend": 0.0,
+                                    "trend_1d": 0.0,
+                                    "trend_7d": 0.0,
+                                    "trend_30d": 0.0
+                                }
 
-                        market_p = p_data.get("marketPrice") or 0.0
-                        low_p = p_data.get("lowPrice") or 0.0
-                        mid_p = p_data.get("midPrice") or 0.0
-                        high_p = p_data.get("highPrice") or 0.0
-                        direct_p = p_data.get("directLowPrice") or 0.0
+                    # 2. Cardmarket Trends
+                    cm_pricing = pricing.get("cardmarket")
+                    if cm_pricing and isinstance(cm_pricing, dict):
+                        for variant, cm_data in cm_pricing.items():
+                            if not isinstance(cm_data, dict):
+                                continue
+                            
+                            if variant in prices_found:
+                                prices_found[variant]["avg"] = cm_data.get("avg") or 0.0
+                                prices_found[variant]["trend"] = cm_data.get("trend") or 0.0
+                                prices_found[variant]["trend_1d"] = cm_data.get("avg1") or 0.0
+                                prices_found[variant]["trend_7d"] = cm_data.get("avg7") or 0.0
+                                prices_found[variant]["trend_30d"] = cm_data.get("avg30") or 0.0
+                                if prices_found[variant]["low"] == 0.0:
+                                    prices_found[variant]["low"] = cm_data.get("low") or 0.0
 
-                        if any([market_p, low_p, mid_p, high_p, direct_p]):
-                            prices_found[variant] = {
-                                "market": market_p, 
-                                "low": low_p, 
-                                "mid": mid_p,
-                                "high": high_p,
-                                "direct": direct_p,
-                                "avg": 0.0,
-                                "trend": 0.0,
-                                "trend_1d": 0.0,
-                                "trend_7d": 0.0,
-                                "trend_30d": 0.0
-                            }
-
-                # 2. Cardmarket Trends
-                cm_pricing = pricing.get("cardmarket")
-                if cm_pricing and isinstance(cm_pricing, dict):
-                    # Sometimes Cardmarket is a single dict, sometimes it has variants?
-                    # TCGDex docs say it's variants if multiple, but let's be robust.
-                    for variant, cm_data in cm_pricing.items():
-                        if not isinstance(cm_data, dict):
-                            continue
+                    # 0. Backfill dex_id from details if missing
+                    if not card.dex_id:
+                        dex_ids = details.get("dexId", [])
+                        if dex_ids and isinstance(dex_ids, list):
+                            card.dex_id = dex_ids[0]
+                    
+                    # 1. Backfill Rarity, Category, etc. if missing
+                    if not card.rarity:
+                        card.rarity = details.get("rarity")
+                        card.category = details.get("category")
+                        card.illustrator = details.get("illustrator")
+                        card.hp = details.get("hp")
+                        card.types = json.dumps(details.get("types")) if details.get("types") else None
+                        card.stage = details.get("stage")
+                        card.suffix = details.get("suffix")
+                        card.attacks = json.dumps(details.get("attacks")) if details.get("attacks") else None
+                        card.weaknesses = json.dumps(details.get("weaknesses")) if details.get("weaknesses") else None
+                        card.retreat = details.get("retreat")
+                        card.regulation_mark = details.get("regulationMark")
+                        card.legal = json.dumps(details.get("legal")) if details.get("legal") else None
+                    
+                    # 3. Lore Enrichment (PokéAPI) - Once per unique Dex ID
+                    if card.dex_id and card.flavor_text is None:
+                        if "pokeapi_cache" not in stats:
+                            stats["pokeapi_cache"] = {}
                         
-                        if variant in prices_found:
-                            prices_found[variant]["avg"] = cm_data.get("avg") or 0.0
-                            prices_found[variant]["trend"] = cm_data.get("trend") or 0.0
-                            prices_found[variant]["trend_1d"] = cm_data.get("avg1") or 0.0
-                            prices_found[variant]["trend_7d"] = cm_data.get("avg7") or 0.0
-                            prices_found[variant]["trend_30d"] = cm_data.get("avg30") or 0.0
-                            # Cardmarket low if low_p was empty
-                            if prices_found[variant]["low"] == 0.0:
-                                prices_found[variant]["low"] = cm_data.get("low") or 0.0
+                        if card.dex_id not in stats["pokeapi_cache"]:
+                            print(f"Enriching Dex ID {card.dex_id} from PokéAPI...")
+                            flavor, evos = await fetch_pokeapi_data(card.dex_id)
+                            stats["pokeapi_cache"][card.dex_id] = (flavor if flavor else "", json.dumps(evos) if evos else None)
+                        
+                        c_flav, c_evos = stats["pokeapi_cache"][card.dex_id]
+                        card.flavor_text = c_flav
+                        if c_evos:
+                            card.evolutions = c_evos
 
-                metadata_updated = False
-                
-                # 0. Backfill dex_id from details if missing
-                if not card.dex_id:
-                    dex_ids = details.get("dexId", [])
-                    if dex_ids and isinstance(dex_ids, list):
-                        card.dex_id = dex_ids[0]
-                        metadata_updated = True
-                
-                # 1. Backfill Rarity, Category, etc. if missing
-                if not card.rarity:
-                    card.rarity = details.get("rarity")
-                    card.category = details.get("category")
-                    card.illustrator = details.get("illustrator")
-                    card.hp = details.get("hp")
-                    card.types = json.dumps(details.get("types")) if details.get("types") else None
-                    card.stage = details.get("stage")
-                    card.suffix = details.get("suffix")
-                    card.attacks = json.dumps(details.get("attacks")) if details.get("attacks") else None
-                    card.weaknesses = json.dumps(details.get("weaknesses")) if details.get("weaknesses") else None
-                    card.retreat = details.get("retreat")
-                    card.regulation_mark = details.get("regulationMark")
-                    card.legal = json.dumps(details.get("legal")) if details.get("legal") else None
-                    metadata_updated = True
-                
-                # 3. Lore Enrichment (PokéAPI) - Once per unique Dex ID
-                if card.dex_id and card.flavor_text is None:
-                    if "pokeapi_cache" not in stats:
-                        stats["pokeapi_cache"] = {}
-                    
-                    if card.dex_id not in stats["pokeapi_cache"]:
-                        print(f"Enriching Dex ID {card.dex_id} from PokéAPI...")
-                        flavor, evos = await fetch_pokeapi_data(card.dex_id)
-                        # Store in cache: empty string "" if not found, to mark as checked
-                        stats["pokeapi_cache"][card.dex_id] = (flavor if flavor else "", json.dumps(evos) if evos else None)
-                        stats["metadata_enriched"] = stats.get("metadata_enriched", 0) + 1
-                    
-                    c_flav, c_evos = stats["pokeapi_cache"][card.dex_id]
-                    card.flavor_text = c_flav
-                    if c_evos:
-                        card.evolutions = c_evos
-                    metadata_updated = True
+                    for variant, p_vals in prices_found.items():
+                        changed, _ = await update_card_price(db, card.id, variant, p_vals)
+                        if changed:
+                            updated_count += 1
+                            stats["variant_updates"][variant] = stats["variant_updates"].get(variant, 0) + 1
 
-                prices_changed = False
-                significant_price_change = False
-                for variant, p_vals in prices_found.items():
-                    changed, sig = await update_card_price(db, card.id, variant, p_vals)
-                    if changed:
-                        prices_changed = True
-                        stats["variant_updates"][variant] = stats["variant_updates"].get(variant, 0) + 1
-                    if sig:
-                        significant_price_change = True
+                    card.updated_at = datetime.datetime.utcnow()
 
-                # Force updated_at refresh on every check to maintain rotation strategy state
-                card.updated_at = datetime.datetime.utcnow()
-                db.commit()
+                except Exception as e:
+                    err_type = type(e).__name__
+                    stats["errors_by_type"][err_type] = stats["errors_by_type"].get(err_type, 0) + 1
+                    if len(errors) < 50:
+                        errors.append(f"{card.id}: {str(e)}")
 
-            except Exception as e:
-                db.rollback()
-                err_type = type(e).__name__
-                stats["errors_by_type"][err_type] = stats["errors_by_type"].get(err_type, 0) + 1
-                # Keep errors list small for DB log
-                if len(errors) < 50:
-                    errors.append(f"{card.id}: {str(e)}")
+            # Batch Commit
+            db.commit()
+            
+            # Progress Log
+            percent = (checked_count / total_to_check) * 100
+            print(
+                f"[{datetime.datetime.utcnow().strftime('%H:%M:%S')}] Progress: {checked_count}/{total_to_check} ({percent:.1f}%) - Updates: {updated_count}"
+            )
 
     # --- FINAL REPORT ---
     print("\n" + "=" * 40)

@@ -80,6 +80,7 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
     """
     metrics = {"new_sets": 0, "new_cards": 0, "cards_processed": 0, "errors": []}
     new_sets_count = 0
+    errors = []
     
     async with httpx.AsyncClient() as client:
         # --- 1. SETS ---

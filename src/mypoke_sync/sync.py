@@ -360,21 +360,52 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
                                     "trend_30d": 0.0
                                 }
 
-                    # 2. Cardmarket Trends
+                    # 2. Cardmarket (Supplement) - Handle both flat and nested JSON
                     cm_pricing = pricing.get("cardmarket")
                     if cm_pricing and isinstance(cm_pricing, dict):
-                        for variant, cm_data in cm_pricing.items():
-                            if not isinstance(cm_data, dict):
-                                continue
-                            
-                            if variant in prices_found:
-                                prices_found[variant]["avg"] = cm_data.get("avg") or 0.0
-                                prices_found[variant]["trend"] = cm_data.get("trend") or 0.0
-                                prices_found[variant]["trend_1d"] = cm_data.get("avg1") or 0.0
-                                prices_found[variant]["trend_7d"] = cm_data.get("avg7") or 0.0
-                                prices_found[variant]["trend_30d"] = cm_data.get("avg30") or 0.0
+                        is_nested = any(isinstance(v, dict) for v in cm_pricing.values())
+                        if is_nested:
+                            for variant, cm_data in cm_pricing.items():
+                                if not isinstance(cm_data, dict):
+                                    continue
+                                
+                                # Create generic variant entry if TCGPlayer missed it or not in found
+                                if variant not in prices_found:
+                                    prices_found[variant] = {
+                                        "market": 0.0, "low": 0.0, "mid": 0.0, "high": 0.0, "direct": 0.0,
+                                        "avg": 0.0, "trend": 0.0, "trend_1d": 0.0, "trend_7d": 0.0, "trend_30d": 0.0
+                                    }
+                                
+                                prices_found[variant].update({
+                                    "avg": cm_data.get("avg") or 0.0,
+                                    "trend": cm_data.get("trend") or 0.0,
+                                    "trend_1d": cm_data.get("avg1") or 0.0,
+                                    "trend_7d": cm_data.get("avg7") or 0.0,
+                                    "trend_30d": cm_data.get("avg30") or 0.0
+                                })
                                 if prices_found[variant]["low"] == 0.0:
                                     prices_found[variant]["low"] = cm_data.get("low") or 0.0
+                        else:
+                            # FLAT structure (standard for TCGDex Cardmarket now)
+                            # If TCGPlayer was null, we synthesize a 'normal' variant to hold the data
+                            if not prices_found:
+                                prices_found["normal"] = {
+                                    "market": 0.0, "low": 0.0, "mid": 0.0, "high": 0.0, "direct": 0.0,
+                                    "avg": 0.0, "trend": 0.0, "trend_1d": 0.0, "trend_7d": 0.0, "trend_30d": 0.0
+                                }
+                            
+                            # Update all variants found (usually 'normal' or 'unlimited') with the flat data
+                            for v in list(prices_found.keys()):
+                                s = "-holo" if "holo" in v.lower() else ""
+                                prices_found[v].update({
+                                    "avg": cm_pricing.get(f"avg{s}") or cm_pricing.get("avg") or 0.0,
+                                    "trend": cm_pricing.get(f"trend{s}") or cm_pricing.get("trend") or 0.0,
+                                    "trend_1d": cm_pricing.get(f"avg1{s}") or cm_pricing.get("avg1") or 0.0,
+                                    "trend_7d": cm_pricing.get(f"avg7{s}") or cm_pricing.get("avg7") or 0.0,
+                                    "trend_30d": cm_pricing.get(f"avg30{s}") or cm_pricing.get("avg30") or 0.0
+                                })
+                                if prices_found[v]["low"] == 0.0:
+                                    prices_found[v]["low"] = cm_pricing.get(f"low{s}") or cm_pricing.get("low") or 0.0
 
                     # 0. Backfill dex_id from details if missing
                     if not card.dex_id:

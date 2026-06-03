@@ -48,7 +48,7 @@ class Card(Base):
     flavor_text = Column(String)
     evolutions = Column(String)  # JSON-encoded list of family members
 
-    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+    updated_at = Column(DateTime)
 
     set = relationship("Set", back_populates="cards")
     prices = relationship("CardPrice", back_populates="card")

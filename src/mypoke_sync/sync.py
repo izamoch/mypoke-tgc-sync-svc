@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from . import models
 from .utils.phash import calculate_phash
 from .pokeapi_client import fetch_pokeapi_data
+from .validator import validate_card_data, validate_price_data, validate_set_data
 
 TCGDEX_API = "https://api.tcgdex.net/v2/en"
 
@@ -21,10 +22,10 @@ SHOULD_STOP = False
 def determine_check_strategy(card: models.Card, max_market_price: float = 0.0) -> str:
     """
     Determines WHY a card is checked (or skipped).
-    Uses a hybrid value-tier + hash rotation strategy:
-      - PREMIUM (market >= $20): checked daily
-      - STANDARD (market $0-$20): checked via hash % 5 (~every 5 days)
-      - NO_PRICE (no price data): checked via hash % 15 (~every 15 days)
+    Uses a hybrid value-tier + hash rotation strategy with minimum cooldowns:
+      - PREMIUM (market >= $20): checked daily (cooldown ~20 hours / 0.83 days)
+      - STANDARD (market $0-$20): checked via hash % 5 (~every 5 days, cooldown 4 days)
+      - NO_PRICE (no price data): checked via hash % 15 (~every 15 days, cooldown 12 days)
     Returns: 'PREMIUM', 'STANDARD', 'NO_PRICE', 'NEW' if checked.
     Returns: 'SKIP' if skipped.
     """
@@ -43,16 +44,16 @@ def determine_check_strategy(card: models.Card, max_market_price: float = 0.0) -
     if max_market_price >= 20.0:
         return "PREMIUM" if last_check_days >= 0.83 else "SKIP"
 
-    # 3. NO_PRICE: rotate hash % 15 (~every 15 days)
+    # 3. NO_PRICE: rotate hash % 15 (~every 15 days) with 12-day cooldown
     if max_market_price == 0.0:
         if last_check_days > 20:
             return "NO_PRICE_SAFETY"
-        return "NO_PRICE" if (card_hash % 15) == (day_of_year % 15) else "SKIP"
+        return "NO_PRICE" if ((card_hash % 15) == (day_of_year % 15) and last_check_days >= 12.0) else "SKIP"
 
-    # 4. STANDARD: rotate hash % 5 (~every 5 days)
+    # 4. STANDARD: rotate hash % 5 (~every 5 days) with 4-day cooldown
     if last_check_days > 8:
         return "STANDARD_SAFETY"
-    return "STANDARD" if (card_hash % 5) == (day_of_year % 5) else "SKIP"
+    return "STANDARD" if ((card_hash % 5) == (day_of_year % 5) and last_check_days >= 4.0) else "SKIP"
 
 
 def should_check_price(card: models.Card, max_market_price: float = 0.0) -> bool:
@@ -96,6 +97,15 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
 
             for s in sets_data:
                 if s["id"] not in existing_set_ids:
+                    # Validate first
+                    set_val_data = {
+                        "id": s.get("id"),
+                        "name": s.get("name")
+                    }
+                    if not validate_set_data(set_val_data):
+                        print(f"Skipping invalid set: {s.get('id')}")
+                        continue
+
                     new_set = models.Set(
                         id=s["id"],
                         name=s["name"],
@@ -182,6 +192,17 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
                             metrics["pokeapi_cache"][dex_id] = (flavor if flavor else "", json.dumps(evos) if evos else None)
                         flavor_text, evolutions = metrics["pokeapi_cache"][dex_id]
 
+                    # Validate first
+                    card_val_data = {
+                        "id": details.get("id"),
+                        "name": details.get("name"),
+                        "set_id": details.get("set", {}).get("id") if isinstance(details.get("set"), dict) else None,
+                        "dex_id": dex_id
+                    }
+                    if not validate_card_data(card_val_data):
+                        print(f"Skipping invalid card: {details.get('id')}")
+                        continue
+
                     new_card = models.Card(
                         id=details["id"],
                         name=details["name"],
@@ -204,7 +225,7 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
                         retreat=details.get("retreat"),
                         regulation_mark=details.get("regulationMark"),
                         legal=json.dumps(details.get("legal")) if details.get("legal") else None,
-                        # updated_at defaults to now
+                        updated_at=None  # Explicitly None to trigger immediate price check
                     )
                     db.add(new_card)
                     metrics["new_cards"] += 1
@@ -223,6 +244,17 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
 
     metrics["new_sets"] = new_sets_count
     return metrics
+
+
+async def _fetch_card_details_concurrent(client: httpx.AsyncClient, card_id: str, semaphore: asyncio.Semaphore):
+    async with semaphore:
+        # Small random delay to stagger concurrent requests
+        await asyncio.sleep(random.uniform(0.05, 0.15))
+        try:
+            response = await client.get(f"{TCGDEX_API}/cards/{card_id}")
+            return card_id, response, None
+        except Exception as e:
+            return card_id, None, e
 
 
 async def sync_prices(db: Session, force_prices: bool = False) -> dict:
@@ -302,22 +334,27 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
                 break
                 
             chunk_ids = card_ids_to_check[i : i + BATCH_SIZE]
+            
+            # Fetch details concurrently for the chunk
+            semaphore = asyncio.Semaphore(10)
+            tasks = [_fetch_card_details_concurrent(client, cid, semaphore) for cid in chunk_ids]
+            results = await asyncio.gather(*tasks)
+            
             # Fetch all card objects for this chunk in ONE query
             cards_chunk = db.query(models.Card).filter(models.Card.id.in_(chunk_ids)).all()
             # Map them by ID for easy access
             cards_by_id = {c.id: c for c in cards_chunk}
 
-            for cid in chunk_ids:
+            for cid, response, err in results:
                 card = cards_by_id.get(cid)
                 if not card:
                     continue
 
                 checked_count += 1
                 try:
-                    # Random sleep to prevent API saturation
-                    await asyncio.sleep(random.uniform(0.1, 0.4))
+                    if err:
+                        raise err
 
-                    response = await client.get(f"{TCGDEX_API}/cards/{card.id}")
                     if response.status_code == 404:
                         card.updated_at = datetime.datetime.utcnow()
                         continue
@@ -444,12 +481,25 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
                             card.evolutions = c_evos
 
                     for variant, p_vals in prices_found.items():
+                        # Validate price data before update
+                        price_val_data = {
+                            "card_id": card.id,
+                            "market": p_vals.get("market"),
+                            "low": p_vals.get("low"),
+                            "mid": p_vals.get("mid"),
+                            "high": p_vals.get("high"),
+                            "direct": p_vals.get("direct"),
+                            "avg": p_vals.get("avg"),
+                            "trend": p_vals.get("trend")
+                        }
+                        if not validate_price_data(price_val_data):
+                            print(f"Skipping price record for card {card.id} variant {variant} due to validation failure.")
+                            continue
+
                         changed, _ = await update_card_price(db, card.id, variant, p_vals)
                         if changed:
                             updated_count += 1
                             stats["variant_updates"][variant] = stats["variant_updates"].get(variant, 0) + 1
-
-                    card.updated_at = datetime.datetime.utcnow()
 
                 except Exception as e:
                     err_type = type(e).__name__

@@ -34,6 +34,15 @@ async def with_async_retry(
         try:
             return await func(*args, **kwargs)
         except Exception as e:
+            # Check for non-retryable HTTP Status errors (400, 401, 403, 404)
+            import httpx
+            if isinstance(e, httpx.HTTPStatusError) and e.response.status_code in (400, 401, 403, 404):
+                logger.warning(
+                    f"Non-retryable HTTP status {e.response.status_code} encountered for {func.__name__}. "
+                    "Failing immediately without retry."
+                )
+                raise e
+
             if retries == max_retries:
                 logger.error(f"Max retries reached ({max_retries}) for {func.__name__}: {e}")
                 raise e

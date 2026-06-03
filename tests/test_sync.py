@@ -45,7 +45,7 @@ def test_standard_hash_hit():
         if (card_hash % 5) == (day_of_year % 5):
             card = Card(
                 id=cid,
-                updated_at=now - datetime.timedelta(days=2),
+                updated_at=now - datetime.timedelta(days=5),
             )
             assert determine_check_strategy(card, max_market_price=5.0) == "STANDARD"
             return
@@ -64,7 +64,7 @@ def test_standard_hash_miss():
         if (card_hash % 5) != (day_of_year % 5):
             card = Card(
                 id=cid,
-                updated_at=now - datetime.timedelta(days=2),
+                updated_at=now - datetime.timedelta(days=5),
             )
             assert determine_check_strategy(card, max_market_price=5.0) == "SKIP"
             return
@@ -92,7 +92,7 @@ def test_no_price_hash_hit():
         if (card_hash % 15) == (day_of_year % 15):
             card = Card(
                 id=cid,
-                updated_at=now - datetime.timedelta(days=5),
+                updated_at=now - datetime.timedelta(days=15),
             )
             assert determine_check_strategy(card, max_market_price=0.0) == "NO_PRICE"
             return
@@ -120,3 +120,23 @@ def test_premium_boundary():
     # $19.99 -> STANDARD tier, result depends on hash match
     result = determine_check_strategy(card, max_market_price=19.99)
     assert result in ("STANDARD", "SKIP")
+
+
+def test_validators():
+    """Verify validator helper functions reject bad data and accept good data"""
+    from mypoke_sync.validator import validate_set_data, validate_card_data, validate_price_data
+
+    # 1. Set validation
+    assert validate_set_data({"id": "swsh1", "name": "Sword & Shield"}) is True
+    assert validate_set_data({"id": "swsh1"}) is False
+    assert validate_set_data({"name": "Sword & Shield"}) is False
+
+    # 2. Card validation
+    assert validate_card_data({"id": "swsh1-1", "name": "Celebi V", "set_id": "swsh1", "dex_id": 251}) is True
+    assert validate_card_data({"id": "swsh1-1", "name": "Celebi V"}) is False
+    assert validate_card_data({"id": "swsh1-1", "name": "Celebi V", "set_id": "swsh1", "dex_id": "not-an-int"}) is False
+
+    # 3. Price validation
+    assert validate_price_data({"card_id": "swsh1-1", "market": 1.5, "low": 1.0}) is True
+    assert validate_price_data({"market": 1.5}) is False
+    assert validate_price_data({"card_id": "swsh1-1", "market": "not-a-number"}) is False

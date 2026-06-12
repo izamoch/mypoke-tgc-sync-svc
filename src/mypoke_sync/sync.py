@@ -376,7 +376,7 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     strat_stats = {"NEW": 0, "PREMIUM": 0, "STANDARD": 0, "STANDARD_SAFETY": 0, "NO_PRICE": 0, "NO_PRICE_SAFETY": 0}
 
     # Subquery: max market price per card (excluding legacy stale variants)
-    from sqlalchemy import func, case
+    from sqlalchemy import func
     max_price_subq = (
         db.query(
             models.CardPrice.card_id,

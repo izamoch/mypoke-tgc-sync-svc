@@ -4,11 +4,12 @@ import hashlib
 import json
 import logging
 import random
+from typing import Any
 
 import httpx
 from sqlalchemy.orm import Session
 
-from . import models
+from . import d1_client, models
 from .utils.phash import calculate_phash
 from .pokeapi_client import fetch_pokeapi_data
 from .validator import validate_card_data, validate_price_data, validate_set_data
@@ -17,6 +18,98 @@ TCGDEX_API = "https://api.tcgdex.net/v2/en"
 
 # Global control flag
 SHOULD_STOP = False
+
+
+def _set_payload(s: models.Set) -> dict:
+    return {
+        "id": s.id,
+        "name": s.name,
+        "series": s.series,
+        "card_count": s.card_count,
+        "image_url": s.image_url,
+        "release_date": s.release_date,
+        "updated_at": datetime.datetime.utcnow().isoformat(),
+    }
+
+
+def _card_payload(c: models.Card) -> dict:
+    return {
+        "id": c.id,
+        "name": c.name,
+        "set_id": c.set_id,
+        "image_url": c.image_url,
+        "phash": c.phash,
+        "dex_id": c.dex_id,
+        "rarity": c.rarity,
+        "category": c.category,
+        "illustrator": c.illustrator,
+        "hp": c.hp,
+        "types": c.types,
+        "stage": c.stage,
+        "suffix": c.suffix,
+        "attacks": c.attacks,
+        "weaknesses": c.weaknesses,
+        "retreat": c.retreat,
+        "regulation_mark": c.regulation_mark,
+        "legal": c.legal,
+        "flavor_text": c.flavor_text,
+        "evolutions": c.evolutions,
+        "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+    }
+
+
+def _price_payload(card_id: str, price_type: str, vals: dict) -> dict:
+    return {
+        "card_id": card_id,
+        "price_type": price_type,
+        "market": vals.get("market", 0.0),
+        "low": vals.get("low", 0.0),
+        "mid": vals.get("mid", 0.0),
+        "high": vals.get("high", 0.0),
+        "direct": vals.get("direct", 0.0),
+        "avg": vals.get("avg", 0.0),
+        "trend": vals.get("trend", 0.0),
+        "trend_1d": vals.get("trend_1d", 0.0),
+        "trend_7d": vals.get("trend_7d", 0.0),
+        "trend_30d": vals.get("trend_30d", 0.0),
+        "updated_at": datetime.datetime.utcnow().isoformat(),
+    }
+
+
+def _new_d1_stats() -> dict[str, Any]:
+    return {"chunks_sent": 0, "total_chunks": 0, "errors": [], "skipped": False}
+
+
+def _merge_d1_result(d1_stats: dict[str, Any], result: dict[str, Any]) -> None:
+    d1_stats["chunks_sent"] += result.get("chunks_sent", 0)
+    d1_stats["total_chunks"] += result.get("total_chunks", 0)
+    d1_stats["errors"].extend(result.get("errors", []))
+    d1_stats["skipped"] = d1_stats["skipped"] or result.get("skipped", False)
+
+
+async def _push_metrics_to_d1(metrics: dict[str, Any], **kwargs: Any) -> None:
+    if not any(kwargs.values()):
+        return
+    d1_result = await d1_client.push_sync_data(**kwargs)
+    _merge_d1_result(metrics["d1_sync"], d1_result)
+    metrics["errors"].extend(d1_result["errors"])
+
+
+async def _push_price_batch_to_d1(
+    d1_stats: dict[str, Any],
+    errors: list[str],
+    touched_cards: list[models.Card],
+    prices_payload: list[dict],
+) -> None:
+    if not (touched_cards or prices_payload):
+        return
+    d1_result = await d1_client.push_sync_data(
+        cards=[_card_payload(c) for c in touched_cards],
+        prices=prices_payload,
+    )
+    _merge_d1_result(d1_stats, d1_result)
+    if len(errors) < 50:
+        errors.extend(d1_result["errors"][: 50 - len(errors)])
 
 
 def determine_check_strategy(card: models.Card, max_market_price: float = 0.0) -> str:
@@ -79,7 +172,7 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
     1. Fetch Sets -> Insert NEW sets only.
     2. Fetch Cards List -> Filter against DB -> Insert NEW cards only (calculating pHash).
     """
-    metrics = {"new_sets": 0, "new_cards": 0, "cards_processed": 0, "errors": []}
+    metrics: dict[str, Any] = {"new_sets": 0, "new_cards": 0, "cards_processed": 0, "errors": [], "d1_sync": _new_d1_stats()}
     new_sets_count = 0
     errors = []
     
@@ -95,6 +188,7 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
             for s in db.query(models.Set.id).yield_per(1000):
                 existing_set_ids.add(s[0])
 
+            sets_payload = []
             for s in sets_data:
                 if s["id"] not in existing_set_ids:
                     # Validate first
@@ -117,10 +211,13 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
                         release_date=s.get("releaseDate"),
                     )
                     db.add(new_set)
+                    sets_payload.append(_set_payload(new_set))
                     new_sets_count += 1
 
             db.commit()
             print(f"Sets synced. Added {new_sets_count} new sets.")
+
+            await _push_metrics_to_d1(metrics, sets=sets_payload)
 
         except Exception as e:
             errors.append(f"Sets sync error: {str(e)}")
@@ -148,6 +245,7 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
             metrics["cards_processed"] = len(new_cards_summary)
             print(f"Found {len(new_cards_summary)} new cards to process.")
 
+            cards_payload = []
             for card_summary in new_cards_summary:
                 if SHOULD_STOP:
                     print("Sync stopping explicitly (Cards loop).")
@@ -230,11 +328,14 @@ async def sync_sets_and_cards(db: Session, card_limit: int = None) -> dict:
                     db.add(new_card)
                     metrics["new_cards"] += 1
                     db.commit()
+                    cards_payload.append(_card_payload(new_card))
 
                 except Exception as e:
                     errors.append(f"Card {card_summary['id']} error: {str(e)}")
                     metrics["errors"].append(f"Card {card_summary['id']} error: {str(e)}")
                     db.rollback()
+
+            await _push_metrics_to_d1(metrics, cards=cards_payload)
 
         except Exception as e:
             errors.append(f"Cards list sync error: {str(e)}")
@@ -315,6 +416,7 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
     BATCH_SIZE = 50
     updated_count = 0
     checked_count = 0
+    d1_stats = _new_d1_stats()
 
     # Detailed Stats
     stats = {
@@ -345,6 +447,9 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
             # Map them by ID for easy access
             cards_by_id = {c.id: c for c in cards_chunk}
 
+            batch_touched_cards = []
+            batch_prices_payload = []
+
             for cid, response, err in results:
                 card = cards_by_id.get(cid)
                 if not card:
@@ -357,12 +462,14 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
 
                     if response.status_code == 404:
                         card.updated_at = datetime.datetime.utcnow()
+                        batch_touched_cards.append(card)
                         continue
 
                     response.raise_for_status()
                     details = response.json()
 
                     card.updated_at = datetime.datetime.utcnow()
+                    batch_touched_cards.append(card)
 
                     pricing = details.get("pricing")
                     if not pricing or not isinstance(pricing, dict):
@@ -500,6 +607,7 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
                         if changed:
                             updated_count += 1
                             stats["variant_updates"][variant] = stats["variant_updates"].get(variant, 0) + 1
+                            batch_prices_payload.append(_price_payload(card.id, variant, p_vals))
 
                 except Exception as e:
                     err_type = type(e).__name__
@@ -509,7 +617,10 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
 
             # Batch Commit
             db.commit()
-            
+
+            # Push this batch's changes to Cloudflare D1 via the Worker (chunked internally)
+            await _push_price_batch_to_d1(d1_stats, errors, batch_touched_cards, batch_prices_payload)
+
             # Progress Log
             percent = (checked_count / total_to_check) * 100
             print(
@@ -539,6 +650,11 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
             print(f"  - {err:<15}: {count}")
     else:
         print("No errors encountered.")
+    print("-" * 20)
+    if d1_stats["skipped"]:
+        print("D1 Sync: SKIPPED (WORKER_URL/ADMIN_TOKEN not configured)")
+    else:
+        print(f"D1 Sync: {d1_stats['chunks_sent']}/{d1_stats['total_chunks']} chunks sent successfully")
     print("=" * 40 + "\n")
 
     return {
@@ -550,6 +666,7 @@ async def sync_prices(db: Session, force_prices: bool = False) -> dict:
         "variant_updates": stats["variant_updates"],
         "errors_by_type": stats["errors_by_type"],
         "error_list": errors,
+        "d1_sync": d1_stats,
     }
 
 

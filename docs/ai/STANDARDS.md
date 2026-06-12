@@ -17,6 +17,6 @@
 - **Reports:** El archivo markdown de reporte en `reports/` es la única fuente oficial del estado de la sincronización.
 
 ## 🔄 Workflow de Vibe Coding
-1. **Analyze:** Antes de modificar modelos, verificar el esquema en Supabase.
+1. **Analyze:** Antes de modificar los modelos o los payloads enviados, verificar el esquema esperado por el Worker/D1.
 2. **Test:** Correr `pytest` tras cada cambio significativo.
 3. **Lint:** Ejecutar `ruff check .` antes de subir cambios.

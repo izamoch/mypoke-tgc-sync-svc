@@ -4,11 +4,11 @@ import logging
 import os
 import sys
 from datetime import datetime
+from typing import Any
 
 import httpx
 from . import sync
-from .export import run_sqlite_export
-from .database import SessionLocal, DATABASE_URL
+from .database import SessionLocal
 
 # Configure logging
 logging.basicConfig(
@@ -19,8 +19,52 @@ logging.basicConfig(
 logger = logging.getLogger("sync_job")
 
 
+def _d1_markdown_section(d1_combined: dict) -> str:
+    if d1_combined["skipped"]:
+        return "\n## Phase 3: Cloudflare D1 Sync\n*(Skipped - WORKER_URL/ADMIN_TOKEN not configured)*\n"
+
+    section = f"\n## Phase 3: Cloudflare D1 Sync\n- **Chunks Sent:** {d1_combined['chunks_sent']} / {d1_combined['total_chunks']}\n"
+    if d1_combined["errors"]:
+        section += "- **Errors:**\n"
+        for err in d1_combined["errors"]:
+            section += f"  - `{err}`\n"
+    return section
+
+
+def _d1_html_section(d1_combined: dict) -> str:
+    if d1_combined["skipped"]:
+        return "<h3>Phase 3: Cloudflare D1 Sync</h3><ul><li><i>(Skipped - WORKER_URL/ADMIN_TOKEN not configured)</i></li></ul>"
+
+    section = (
+        "<h3>Phase 3: Cloudflare D1 Sync</h3><ul>"
+        f"<li><b>Chunks Sent:</b> {d1_combined['chunks_sent']} / {d1_combined['total_chunks']}</li>"
+    )
+    if d1_combined["errors"]:
+        section += "<li><b style='color:red;'>Errors:</b><ul>"
+        for err in d1_combined["errors"]:
+            section += f"<li>{err}</li>"
+        section += "</ul></li>"
+    section += "</ul>"
+    return section
+
+
+def _combine_d1_stats(cards_metrics: dict, prices_metrics: dict) -> dict[str, Any]:
+    """Merges the Cloudflare D1 push stats reported by each sync phase."""
+    combined: dict[str, Any] = {"chunks_sent": 0, "total_chunks": 0, "errors": [], "skipped": False}
+    for metrics in (cards_metrics, prices_metrics):
+        d1 = (metrics or {}).get("d1_sync")
+        if not d1:
+            continue
+        combined["chunks_sent"] += d1.get("chunks_sent", 0)
+        combined["total_chunks"] += d1.get("total_chunks", 0)
+        combined["errors"].extend(d1.get("errors", []))
+        combined["skipped"] = combined["skipped"] or d1.get("skipped", False)
+    return combined
+
+
 def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dict, prices_metrics: dict):
     duration = (end_time - start_time).total_seconds()
+    d1_combined = _combine_d1_stats(cards_metrics, prices_metrics)
     report_desc = f"# Sync Report - {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
     report_desc += f"**Duration:** {duration:.1f} seconds\n\n"
 
@@ -56,6 +100,8 @@ def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dic
                 report_desc += f"- **{etype}:** {count}\n"
     else:
         report_desc += "*(Failed or Skipped)*\n"
+
+    report_desc += _d1_markdown_section(d1_combined)
 
     # Save report locally
     report_filename = f"reports/sync_report_{start_time.strftime('%Y%m%d_%H%M%S')}.md"
@@ -115,6 +161,8 @@ def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dic
             html_desc += "<li><i>(Failed or Skipped)</i></li>"
         html_desc += "</ul>"
 
+        html_desc += _d1_html_section(d1_combined)
+
         payload = {
             "timestamp": start_time.isoformat(),
             "duration_seconds": duration,
@@ -124,6 +172,9 @@ def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dic
                 "new_sets": cards_metrics.get("new_sets", 0) if cards_metrics else 0,
                 "new_cards": cards_metrics.get("new_cards", 0) if cards_metrics else 0,
                 "prices_updated": prices_metrics.get("updated_count", 0) if prices_metrics else 0,
+                "d1_chunks_sent": d1_combined["chunks_sent"],
+                "d1_total_chunks": d1_combined["total_chunks"],
+                "d1_skipped": d1_combined["skipped"],
             },
         }
 
@@ -179,15 +230,6 @@ async def run_sync_job(force_prices: bool = False):
         end_time = datetime.utcnow()
     finally:
         generate_report(start_time, datetime.utcnow(), cards_metrics, prices_metrics)
-        
-        # Step 3: Local SQLite Export
-        if os.getenv("DATABASE_URL") and os.getenv("DATABASE_URL").startswith("postgres"):
-            try:
-                logger.info("Executing Phase 3: Local SQLite Export...")
-                run_sqlite_export(os.getenv("DATABASE_URL"))
-                logger.info("Local SQLite Export completed.")
-            except Exception as e:
-                logger.error(f"Failed to perform local SQLite export: {e}")
 
 
 def main():

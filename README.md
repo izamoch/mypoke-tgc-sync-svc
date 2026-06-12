@@ -6,9 +6,9 @@ Incremental synchronization engine for Pokémon TCG data, aligned with TCGDex AP
 - **Granular Pricing**: Full support for TCGPlayer (`market`, `low`, `mid`, `high`, `direct`) and Cardmarket (`avg`, `trend`, and 1d/7d/30d temporal averages).
 - **Lore Enrichment**: Automatic backfill of Pokédex flavor text and evolution chains using PokéAPI.
 - **Smart Sync Strategy**: Hybrid value-tier + hash rotation — Premium cards (≥$20) checked daily, Standard ($0-$20) via `hash % 5` (~every 5 days), and cards without price data via `hash % 15` (~every 15 days). Safety nets ensure no card goes unchecked indefinitely.
-- **Supabase Integration**: Native support for PostgreSQL/Supabase with optimized indexes for mobile search.
-- **Auto-Reporting**: Local and webhook-based markdown reports after every sync run.
-- **Local SQLite Backup**: Automatic "overwrite" replication of the full database from Supabase to a local SQLite file (`/data/poke_tgc.sqlite`) at the end of each sync job.
+- **Cloudflare D1 Sync**: New/updated sets, cards and prices are pushed to a Cloudflare Worker (`POST /sync/update`), which writes them to D1. Payloads are chunked (default 150 records per list per request) and sent with simple retry/backoff on 4xx/5xx errors.
+- **Local SQLite State Store**: A local SQLite database (`/data/poke_tgc.sqlite`) tracks existing sets/cards and price history, driving the Smart Sync cooldown strategy without needing a direct connection to the production database.
+- **Auto-Reporting**: Local and webhook-based markdown reports after every sync run, including D1 push status.
 
 ## 📊 Database Schema (v3)
 
@@ -45,6 +45,17 @@ Stores multiple price variants per card.
 Current core logic coverage:
 - `models.py`: 100%
 - `sync.py` (strategy): Verified 100% for `determine_check_strategy`
+
+## ⚙️ Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `WORKER_URL` | Yes | Base URL of the Cloudflare Worker exposing the D1 sync API (e.g. `https://mypoke-api.example.workers.dev`). Updates are POSTed to `{WORKER_URL}/sync/update`. |
+| `ADMIN_TOKEN` | Yes | Shared secret sent as the `X-API-Key` header to authenticate against the Worker. |
+| `DATABASE_URL` | No | SQLAlchemy URL for the local sync-state database. Defaults to `sqlite:///./data/poke_tgc.sqlite`. |
+| `REPORT_WEBHOOK_URL` | No | If set, sends a JSON sync report (markdown + HTML) to this URL after each run. |
+
+If `WORKER_URL`/`ADMIN_TOKEN` are not set, the sync runs normally against the local SQLite state database but skips pushing data to Cloudflare D1 (logged as `D1 Sync: SKIPPED`).
 
 ## 🏁 Getting Started
 

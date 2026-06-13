@@ -1,0 +1,2 @@
+[console_scripts]
+mypoke-sync = mypoke_sync.main:main

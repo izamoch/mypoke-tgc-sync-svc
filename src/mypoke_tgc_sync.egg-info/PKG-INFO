@@ -1,0 +1,17 @@
+Metadata-Version: 2.4
+Name: mypoke_tgc_sync
+Version: 0.1.0
+Summary: Sync Pokémon TCG data directly to Cloudflare D1
+Requires-Python: >=3.11
+Requires-Dist: httpx>=0.25.0
+Requires-Dist: pillow>=10.0.0
+Requires-Dist: imagehash>=4.3.0
+Requires-Dist: python-dotenv>=1.0.0
+Provides-Extra: dev
+Requires-Dist: ruff==0.3.0; extra == "dev"
+Requires-Dist: mypy==1.9.0; extra == "dev"
+Requires-Dist: pytest==8.1.1; extra == "dev"
+Requires-Dist: pytest-asyncio==0.23.5; extra == "dev"
+Requires-Dist: pytest-cov==4.1.0; extra == "dev"
+Requires-Dist: pre-commit==3.6.2; extra == "dev"
+Requires-Dist: types-Pillow==10.2.0.20240213; extra == "dev"

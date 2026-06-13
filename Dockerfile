@@ -4,17 +4,15 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Copy requirements
-COPY requirements.txt .
+# Copy setup metadata and package source for installation caching
+COPY pyproject.toml .
+COPY src/ ./src/
 
-# Install dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install the package and its runtime dependencies declared in pyproject.toml
+RUN pip install --no-cache-dir .
 
-# Copy project files
+# Copy the rest of the project files
 COPY . .
 
-# Set PYTHONPATH to include src
-ENV PYTHONPATH=/app/src
-
-# Run the sync job by default using the module entry point
-CMD ["python", "-m", "mypoke_sync.main"]
+# Run the sync job by default using the CLI executable registered by pip
+CMD ["mypoke-sync"]

@@ -7,6 +7,23 @@ name = "mypoke_tgc_sync"
 version = "0.1.0"
 description = "Sync Pokémon TCG data directly to Cloudflare D1"
 requires-python = ">=3.11"
+dependencies = [
+    "httpx>=0.25.0",
+    "pillow>=10.0.0",
+    "imagehash>=4.3.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff==0.3.0",
+    "mypy==1.9.0",
+    "pytest==8.1.1",
+    "pytest-asyncio==0.23.5",
+    "pytest-cov==4.1.0",
+    "pre-commit==3.6.2",
+    "types-Pillow==10.2.0.20240213",
+]
 
 [project.scripts]
 mypoke-sync = "mypoke_sync.main:main"

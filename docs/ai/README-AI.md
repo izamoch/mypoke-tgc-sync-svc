@@ -9,7 +9,7 @@ Estado actual del servicio, logs de la última ejecución y tareas pendientes.
 El "por qué" de la estrategia de sincronización (Smart Sync, Delta Updates, Lore Enrichment).
 
 ### 3. 🏗️ [Estructura del Servicio: ARCH.md](./ARCH.md)
-El "cómo". Integración con Cloudflare D1 vía Worker HTTP API, estado local en SQLite y cliente de PokéAPI/TCGDex.
+El "cómo". Conexión directa a Cloudflare D1 vía su API REST (`d1_client.py`, única fuente de la verdad, sin estado local) y cliente de PokéAPI/TCGDex.
 
 ### 4. 🛠️ [Guía de Calidad: STANDARDS.md](./STANDARDS.md)
 Normas de Python (Ruff/Mypy), manejo de concurrencia asíncrona y protocolos de reporte.

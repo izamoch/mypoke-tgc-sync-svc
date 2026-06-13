@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mypoke_tgc_sync"
 version = "0.1.0"
-description = "Sync Pokémon TCG data to local database"
+description = "Sync Pokémon TCG data directly to Cloudflare D1"
 requires-python = ">=3.11"
 
 [project.scripts]
@@ -43,7 +43,6 @@ mypy_path = "src"
 # Ignore missing typing stubs for specific libraries
 module = [
     "imagehash.*",
-    "sqlalchemy.*",
 ]
 ignore_missing_imports = true
 

@@ -6,108 +6,186 @@ import httpx
 
 logger = logging.getLogger("d1_client")
 
-SYNC_PATH = "/sync/update"
+CF_API_BASE = "https://api.cloudflare.com/client/v4"
 
-# Cloudflare Workers / D1 impose limits on request body size and execution time,
-# so updates are sent in small successive batches rather than one large payload.
-DEFAULT_CHUNK_SIZE = 150
+# D1 rejects statements with more than 100 bound parameters
+# (SQLITE_ERROR "too many SQL variables"), so upserts are chunked accordingly.
+D1_MAX_PARAMS_PER_STATEMENT = 100
+
+# Number of independent statements bundled into a single /raw batch request.
+DEFAULT_STATEMENTS_PER_REQUEST = 50
+
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_DELAY = 2.0
 
 
-async def push_sync_data(
-    sets: list[dict] | None = None,
-    cards: list[dict] | None = None,
-    prices: list[dict] | None = None,
-    chunk_size: int = DEFAULT_CHUNK_SIZE,
-) -> dict:
-    """
-    Sends sets/cards/prices to the Cloudflare Worker sync endpoint.
+class D1Error(Exception):
+    """Raised when the D1 REST API reports a request or query error."""
 
-    Splits the data into successive chunks of `chunk_size` records per list and
-    issues one POST per chunk, so large updates stay within Worker/D1 request
-    size and execution time limits.
-    """
-    sets = sets or []
-    cards = cards or []
-    prices = prices or []
 
-    if not (sets or cards or prices):
-        return {"skipped": False, "chunks_sent": 0, "total_chunks": 0, "errors": []}
-
-    worker_url = os.getenv("WORKER_URL", "").rstrip("/")
-    admin_token = os.getenv("ADMIN_TOKEN", "")
-
-    if not worker_url or not admin_token:
-        logger.warning(
-            "WORKER_URL and/or ADMIN_TOKEN are not configured. Skipping D1 sync push "
-            f"({len(sets)} sets, {len(cards)} cards, {len(prices)} prices not sent)."
-        )
-        return {"skipped": True, "chunks_sent": 0, "total_chunks": 0, "errors": []}
-
-    num_chunks = max(
-        (len(sets) + chunk_size - 1) // chunk_size,
-        (len(cards) + chunk_size - 1) // chunk_size,
-        (len(prices) + chunk_size - 1) // chunk_size,
-        1,
+def is_configured() -> bool:
+    return bool(
+        os.getenv("CLOUDFLARE_ACCOUNT_ID") and os.getenv("CLOUDFLARE_API_TOKEN") and os.getenv("D1_DATABASE_ID")
     )
 
-    url = f"{worker_url}{SYNC_PATH}"
-    headers = {"X-API-Key": admin_token, "Content-Type": "application/json"}
 
-    chunks_sent = 0
-    errors: list[str] = []
+def _base_url() -> str:
+    account_id = os.getenv("CLOUDFLARE_ACCOUNT_ID", "")
+    database_id = os.getenv("D1_DATABASE_ID", "")
+    return f"{CF_API_BASE}/accounts/{account_id}/d1/database/{database_id}"
 
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        for i in range(num_chunks):
-            start, end = i * chunk_size, (i + 1) * chunk_size
-            payload = {
-                "sets": sets[start:end],
-                "cards": cards[start:end],
-                "prices": prices[start:end],
-            }
-            if not (payload["sets"] or payload["cards"] or payload["prices"]):
-                continue
 
-            try:
-                await _post_with_retry(client, url, headers, payload)
-                chunks_sent += 1
-            except Exception as e:
-                msg = f"Chunk {i + 1}/{num_chunks} failed: {e}"
-                logger.error(msg)
-                errors.append(msg)
-
-    return {"skipped": False, "chunks_sent": chunks_sent, "total_chunks": num_chunks, "errors": errors}
+def _headers() -> dict:
+    return {
+        "Authorization": f"Bearer {os.getenv('CLOUDFLARE_API_TOKEN', '')}",
+        "Content-Type": "application/json",
+    }
 
 
 async def _post_with_retry(
     client: httpx.AsyncClient,
     url: str,
-    headers: dict,
-    payload: dict,
+    body: dict,
     max_retries: int = DEFAULT_MAX_RETRIES,
     base_delay: float = DEFAULT_RETRY_DELAY,
 ) -> httpx.Response:
-    """
-    POSTs the payload, retrying on HTTP error responses (4xx/5xx) and network
-    errors with exponential backoff.
-    """
+    """POSTs the body, retrying on HTTP error responses and network errors with exponential backoff."""
     delay = base_delay
     for attempt in range(1, max_retries + 1):
         try:
-            response = await client.post(url, json=payload, headers=headers)
+            response = await client.post(url, json=body, headers=_headers())
             response.raise_for_status()
             return response
         except (httpx.HTTPStatusError, httpx.TransportError) as e:
             if attempt == max_retries:
                 raise
-
             status = e.response.status_code if isinstance(e, httpx.HTTPStatusError) else "network error"
             logger.warning(
-                f"POST {url} failed (attempt {attempt}/{max_retries}, status={status}): {e}. "
-                f"Retrying in {delay:.1f}s..."
+                f"POST {url} failed (attempt {attempt}/{max_retries}, status={status}): {e}. Retrying in {delay:.1f}s..."
             )
             await asyncio.sleep(delay)
             delay *= 2
 
     raise RuntimeError("unreachable")
+
+
+async def d1_query(sql: str, params: list | None = None) -> list[dict]:
+    """Executes a single SQL statement against D1 and returns its result rows."""
+    if not is_configured():
+        raise D1Error("CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN and D1_DATABASE_ID must be configured")
+
+    body: dict = {"sql": sql}
+    if params is not None:
+        body["params"] = params
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await _post_with_retry(client, f"{_base_url()}/query", body)
+
+    data = response.json()
+    if not data.get("success") or data.get("errors"):
+        raise D1Error(f"D1 query failed: {data.get('errors')}")
+
+    result = data.get("result") or []
+    if not result:
+        return []
+    return result[0].get("results") or []
+
+
+async def d1_raw_batch(statements: list[dict]) -> list[dict]:
+    """Executes a batch of independent {sql, params} statements via the /raw endpoint."""
+    if not statements:
+        return []
+
+    if not is_configured():
+        raise D1Error("CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN and D1_DATABASE_ID must be configured")
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        response = await _post_with_retry(client, f"{_base_url()}/raw", {"batch": statements})
+
+    data = response.json()
+    if not data.get("success") or data.get("errors"):
+        raise D1Error(f"D1 batch failed: {data.get('errors')}")
+
+    return data.get("result") or []
+
+
+async def chunked_upsert(
+    table: str,
+    columns: list[str],
+    conflict_columns: list[str],
+    rows: list[dict],
+    statements_per_request: int = DEFAULT_STATEMENTS_PER_REQUEST,
+) -> dict:
+    """
+    Upserts `rows` into `table` via `INSERT ... ON CONFLICT DO UPDATE SET col=excluded.col`.
+
+    Rows are grouped into multi-row INSERT statements bounded by D1's
+    100-bound-parameters-per-statement limit, and multiple statements are
+    sent per HTTP request via the /raw batch endpoint.
+    """
+    if not rows:
+        return {"rows_written": 0, "errors": []}
+
+    rows_per_statement = max(1, D1_MAX_PARAMS_PER_STATEMENT // len(columns))
+    update_columns = [c for c in columns if c not in conflict_columns]
+    row_placeholder = "(" + ", ".join(["?"] * len(columns)) + ")"
+    update_sql = ", ".join(f"{c}=excluded.{c}" for c in update_columns)
+    conflict_sql = ", ".join(conflict_columns)
+    columns_sql = ", ".join(columns)
+
+    statements = []
+    for i in range(0, len(rows), rows_per_statement):
+        chunk = rows[i : i + rows_per_statement]
+        values_sql = ", ".join([row_placeholder] * len(chunk))
+        sql = (
+            f"INSERT INTO {table} ({columns_sql}) VALUES {values_sql} "
+            f"ON CONFLICT({conflict_sql}) DO UPDATE SET {update_sql}"
+        )
+        params = [row.get(c) for row in chunk for c in columns]
+        statements.append({"sql": sql, "params": params})
+
+    return await _run_statement_batches(table, statements, statements_per_request)
+
+
+async def chunked_update(
+    table: str,
+    set_columns: list[str],
+    where_column: str,
+    rows: list[dict],
+    statements_per_request: int = DEFAULT_STATEMENTS_PER_REQUEST,
+) -> dict:
+    """
+    Updates `rows` in `table` via one `UPDATE ... SET ... WHERE where_column = ?` per row.
+
+    Multiple single-row UPDATE statements are sent per HTTP request via the
+    /raw batch endpoint.
+    """
+    if not rows:
+        return {"rows_written": 0, "errors": []}
+
+    set_sql = ", ".join(f"{c}=?" for c in set_columns)
+
+    statements = []
+    for row in rows:
+        sql = f"UPDATE {table} SET {set_sql} WHERE {where_column}=?"
+        params = [row.get(c) for c in set_columns] + [row[where_column]]
+        statements.append({"sql": sql, "params": params})
+
+    return await _run_statement_batches(table, statements, statements_per_request)
+
+
+async def _run_statement_batches(table: str, statements: list[dict], statements_per_request: int) -> dict:
+    rows_written = 0
+    errors: list[str] = []
+
+    for i in range(0, len(statements), statements_per_request):
+        batch = statements[i : i + statements_per_request]
+        try:
+            results = await d1_raw_batch(batch)
+            rows_written += sum(r.get("meta", {}).get("rows_written", r.get("meta", {}).get("changes", 0)) for r in results)
+        except Exception as e:
+            msg = f"{table} batch {i // statements_per_request + 1} failed: {e}"
+            logger.error(msg)
+            errors.append(msg)
+
+    return {"rows_written": rows_written, "errors": errors}

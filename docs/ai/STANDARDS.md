@@ -8,7 +8,7 @@
 
 ## 🧪 Protocolo de Testing
 - **Unit Testing:** Obligatorio para lógica de transformación y cliente de APIs.
-- **Mocks:** Usar `pytest-mock` para evitar peticiones reales a TCGDex/PokéAPI.
+- **Mocks:** Mockear `httpx.AsyncClient` (vía `httpx.MockTransport`) para evitar peticiones reales a TCGDex, PokéAPI y la API REST de Cloudflare D1.
 - **Coverage:** El objetivo de cobertura mínima es del 80%.
 
 ## 🐞 Debugging & Logging

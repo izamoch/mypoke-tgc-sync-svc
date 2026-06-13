@@ -4,11 +4,10 @@ import logging
 import os
 import sys
 from datetime import datetime
-from typing import Any
 
 import httpx
-from . import sync
-from .database import SessionLocal
+
+from . import d1_client, sync
 
 # Configure logging
 logging.basicConfig(
@@ -19,52 +18,38 @@ logging.basicConfig(
 logger = logging.getLogger("sync_job")
 
 
-def _d1_markdown_section(d1_combined: dict) -> str:
-    if d1_combined["skipped"]:
-        return "\n## Phase 3: Cloudflare D1 Sync\n*(Skipped - WORKER_URL/ADMIN_TOKEN not configured)*\n"
+def _d1_markdown_section(d1_errors: list[str]) -> str:
+    if not d1_errors:
+        return "\n## Phase 3: Cloudflare D1 Writes\n- **Status:** OK\n"
 
-    section = f"\n## Phase 3: Cloudflare D1 Sync\n- **Chunks Sent:** {d1_combined['chunks_sent']} / {d1_combined['total_chunks']}\n"
-    if d1_combined["errors"]:
-        section += "- **Errors:**\n"
-        for err in d1_combined["errors"]:
-            section += f"  - `{err}`\n"
+    section = "\n## Phase 3: Cloudflare D1 Writes\n- **Errors:**\n"
+    for err in d1_errors:
+        section += f"  - `{err}`\n"
     return section
 
 
-def _d1_html_section(d1_combined: dict) -> str:
-    if d1_combined["skipped"]:
-        return "<h3>Phase 3: Cloudflare D1 Sync</h3><ul><li><i>(Skipped - WORKER_URL/ADMIN_TOKEN not configured)</i></li></ul>"
+def _d1_html_section(d1_errors: list[str]) -> str:
+    if not d1_errors:
+        return "<h3>Phase 3: Cloudflare D1 Writes</h3><ul><li>Status: OK</li></ul>"
 
-    section = (
-        "<h3>Phase 3: Cloudflare D1 Sync</h3><ul>"
-        f"<li><b>Chunks Sent:</b> {d1_combined['chunks_sent']} / {d1_combined['total_chunks']}</li>"
-    )
-    if d1_combined["errors"]:
-        section += "<li><b style='color:red;'>Errors:</b><ul>"
-        for err in d1_combined["errors"]:
-            section += f"<li>{err}</li>"
-        section += "</ul></li>"
-    section += "</ul>"
+    section = "<h3>Phase 3: Cloudflare D1 Writes</h3><ul><li><b style='color:red;'>Errors:</b><ul>"
+    for err in d1_errors:
+        section += f"<li>{err}</li>"
+    section += "</ul></li></ul>"
     return section
 
 
-def _combine_d1_stats(cards_metrics: dict, prices_metrics: dict) -> dict[str, Any]:
-    """Merges the Cloudflare D1 push stats reported by each sync phase."""
-    combined: dict[str, Any] = {"chunks_sent": 0, "total_chunks": 0, "errors": [], "skipped": False}
+def _combine_d1_errors(cards_metrics: dict, prices_metrics: dict) -> list[str]:
+    """Merges the Cloudflare D1 write errors reported by each sync phase."""
+    errors: list[str] = []
     for metrics in (cards_metrics, prices_metrics):
-        d1 = (metrics or {}).get("d1_sync")
-        if not d1:
-            continue
-        combined["chunks_sent"] += d1.get("chunks_sent", 0)
-        combined["total_chunks"] += d1.get("total_chunks", 0)
-        combined["errors"].extend(d1.get("errors", []))
-        combined["skipped"] = combined["skipped"] or d1.get("skipped", False)
-    return combined
+        errors.extend((metrics or {}).get("d1_errors", []))
+    return errors
 
 
 def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dict, prices_metrics: dict):
     duration = (end_time - start_time).total_seconds()
-    d1_combined = _combine_d1_stats(cards_metrics, prices_metrics)
+    d1_errors = _combine_d1_errors(cards_metrics, prices_metrics)
     report_desc = f"# Sync Report - {start_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n\n"
     report_desc += f"**Duration:** {duration:.1f} seconds\n\n"
 
@@ -101,7 +86,7 @@ def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dic
     else:
         report_desc += "*(Failed or Skipped)*\n"
 
-    report_desc += _d1_markdown_section(d1_combined)
+    report_desc += _d1_markdown_section(d1_errors)
 
     # Save report locally
     report_filename = f"reports/sync_report_{start_time.strftime('%Y%m%d_%H%M%S')}.md"
@@ -161,7 +146,7 @@ def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dic
             html_desc += "<li><i>(Failed or Skipped)</i></li>"
         html_desc += "</ul>"
 
-        html_desc += _d1_html_section(d1_combined)
+        html_desc += _d1_html_section(d1_errors)
 
         payload = {
             "timestamp": start_time.isoformat(),
@@ -172,9 +157,7 @@ def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dic
                 "new_sets": cards_metrics.get("new_sets", 0) if cards_metrics else 0,
                 "new_cards": cards_metrics.get("new_cards", 0) if cards_metrics else 0,
                 "prices_updated": prices_metrics.get("updated_count", 0) if prices_metrics else 0,
-                "d1_chunks_sent": d1_combined["chunks_sent"],
-                "d1_total_chunks": d1_combined["total_chunks"],
-                "d1_skipped": d1_combined["skipped"],
+                "d1_errors": len(d1_errors),
             },
         }
 
@@ -196,6 +179,12 @@ async def run_sync_job(force_prices: bool = False):
     start_time = datetime.utcnow()
     logger.info(f"Starting scheduled PokeTCG Sync Job at {start_time} (UTC)")
 
+    if not d1_client.is_configured():
+        logger.error(
+            "CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN and D1_DATABASE_ID must be set. Aborting."
+        )
+        return
+
     sync.start_sync_flag()
     cards_metrics = {}
     prices_metrics = {}
@@ -203,11 +192,7 @@ async def run_sync_job(force_prices: bool = False):
     try:
         # Step 1: Sync Sets and New Cards
         logger.info("Executing Phase 1: Sets and Cards synchronization...")
-        db1 = SessionLocal()
-        try:
-            cards_metrics = await sync.sync_sets_and_cards(db1)
-        finally:
-            db1.close()
+        cards_metrics = await sync.sync_sets_and_cards()
 
         if sync.SHOULD_STOP:
             logger.warning("Sync stopped prematurely during Cards phase. Exiting.")
@@ -215,11 +200,7 @@ async def run_sync_job(force_prices: bool = False):
 
         # Step 2: Sync Prices based on Temperature Strategy
         logger.info("Executing Phase 2: Price synchronization...")
-        db2 = SessionLocal()
-        try:
-            prices_metrics = await sync.sync_prices(db2, force_prices=force_prices)
-        finally:
-            db2.close()
+        prices_metrics = await sync.sync_prices(force_prices=force_prices)
 
         end_time = datetime.utcnow()
         duration = (end_time - start_time).total_seconds()

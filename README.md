@@ -6,9 +6,8 @@ Incremental synchronization engine for Pokémon TCG data, aligned with TCGDex AP
 - **Granular Pricing**: Full support for TCGPlayer (`market`, `low`, `mid`, `high`, `direct`) and Cardmarket (`avg`, `trend`, and 1d/7d/30d temporal averages).
 - **Lore Enrichment**: Automatic backfill of Pokédex flavor text and evolution chains using PokéAPI.
 - **Smart Sync Strategy**: Hybrid value-tier + hash rotation — Premium cards (≥$20) checked daily, Standard ($0-$20) via `hash % 5` (~every 5 days), and cards without price data via `hash % 15` (~every 15 days). Safety nets ensure no card goes unchecked indefinitely.
-- **Cloudflare D1 Sync**: New/updated sets, cards and prices are pushed to a Cloudflare Worker (`POST /sync/update`), which writes them to D1. Payloads are chunked (default 150 records per list per request) and sent with simple retry/backoff on 4xx/5xx errors.
-- **Local SQLite State Store**: A local SQLite database (`/data/poke_tgc.sqlite`) tracks existing sets/cards and price history, driving the Smart Sync cooldown strategy without needing a direct connection to the production database.
-- **Auto-Reporting**: Local and webhook-based markdown reports after every sync run, including D1 push status.
+- **Direct Cloudflare D1 Sync**: D1 is the single source of truth. The service reads and writes directly to D1 via its REST API (`d1_client.py`) — no local database, no proxy Worker in the write path. Reads are scoped to "just what's needed" (existing IDs, Smart Sync candidates); writes use chunked `INSERT ... ON CONFLICT DO UPDATE` / `UPDATE` statements respecting D1's 100-bound-parameters-per-statement limit.
+- **Auto-Reporting**: Local and webhook-based markdown/HTML reports after every sync run, including any D1 write errors.
 
 ## 📊 Database Schema (v3)
 
@@ -43,19 +42,19 @@ Stores multiple price variants per card.
 
 ### Test Coverage
 Current core logic coverage:
-- `models.py`: 100%
 - `sync.py` (strategy): Verified 100% for `determine_check_strategy`
+- `d1_client.py`: Unit tested against a mocked Cloudflare D1 REST API (`httpx.MockTransport`).
 
 ## ⚙️ Environment Variables
 
 | Variable | Required | Description |
 |---|---|---|
-| `WORKER_URL` | Yes | Base URL of the Cloudflare Worker exposing the D1 sync API (e.g. `https://mypoke-api.example.workers.dev`). Updates are POSTed to `{WORKER_URL}/sync/update`. |
-| `ADMIN_TOKEN` | Yes | Shared secret sent as the `X-API-Key` header to authenticate against the Worker. |
-| `DATABASE_URL` | No | SQLAlchemy URL for the local sync-state database. Defaults to `sqlite:///./data/poke_tgc.sqlite`. |
+| `CLOUDFLARE_ACCOUNT_ID` | Yes | Cloudflare account ID (Dashboard → Workers & Pages → Overview). |
+| `CLOUDFLARE_API_TOKEN` | Yes | API token with `D1:Edit` permission, scoped to the database below. |
+| `D1_DATABASE_ID` | Yes | Cloudflare D1 database ID (`wrangler d1 list`). |
 | `REPORT_WEBHOOK_URL` | No | If set, sends a JSON sync report (markdown + HTML) to this URL after each run. |
 
-If `WORKER_URL`/`ADMIN_TOKEN` are not set, the sync runs normally against the local SQLite state database but skips pushing data to Cloudflare D1 (logged as `D1 Sync: SKIPPED`).
+If `CLOUDFLARE_ACCOUNT_ID`/`CLOUDFLARE_API_TOKEN`/`D1_DATABASE_ID` are not set, the job aborts immediately — D1 is the only source of state, so there is no degraded "skip" mode.
 
 ## 🏁 Getting Started
 
@@ -79,7 +78,6 @@ If `WORKER_URL`/`ADMIN_TOKEN` are not set, the sync runs normally against the lo
    ```
 
 3. **Project Structure**:
-   - `src/mypoke_sync/`: Core package containing database models, sync logic, and PokéAPI client.
+   - `src/mypoke_sync/`: Core package containing the D1 client, sync logic, and PokéAPI/TCGDex clients.
    - `tests/`: Automated test suite.
-   - `data/`: Local SQLite database storage.
-   - `reports/`: Markdown sync reports generated after each run.
+   - `reports/`: Markdown/HTML sync reports generated after each run.

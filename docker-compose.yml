@@ -8,7 +8,6 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
     volumes:
-      - ./data:/app/data
       - ./reports:/app/reports
     restart: "no" # Runs once and exits. Trigger manually or via n8n cron.
     deploy:

@@ -1,5 +1,4 @@
 httpx
-sqlalchemy
 pillow
 imagehash
 python-dotenv

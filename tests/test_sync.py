@@ -1,8 +1,15 @@
 import datetime
 import hashlib
+
 import pytest
-from mypoke_sync.sync import determine_check_strategy
-from mypoke_sync.models import Card
+
+from mypoke_sync.sync import (
+    Card,
+    _extract_prices_found,
+    _parse_dt,
+    determine_check_strategy,
+    update_card_price,
+)
 
 
 def test_new_card():
@@ -124,7 +131,7 @@ def test_premium_boundary():
 
 def test_validators():
     """Verify validator helper functions reject bad data and accept good data"""
-    from mypoke_sync.validator import validate_set_data, validate_card_data, validate_price_data
+    from mypoke_sync.validator import validate_card_data, validate_price_data, validate_set_data
 
     # 1. Set validation
     assert validate_set_data({"id": "swsh1", "name": "Sword & Shield"}) is True
@@ -140,3 +147,98 @@ def test_validators():
     assert validate_price_data({"card_id": "swsh1-1", "market": 1.5, "low": 1.0}) is True
     assert validate_price_data({"market": 1.5}) is False
     assert validate_price_data({"card_id": "swsh1-1", "market": "not-a-number"}) is False
+
+
+def test_parse_dt():
+    assert _parse_dt(None) is None
+    assert _parse_dt("") is None
+    assert _parse_dt("2026-06-08T10:23:45.123456") == datetime.datetime(2026, 6, 8, 10, 23, 45, 123456)
+
+
+def test_update_card_price_new_record():
+    """A variant with no existing row is always a significant change."""
+    changed, significant, row = update_card_price(None, "swsh1-1", "normal", {"market": 5.0, "low": 4.0})
+
+    assert changed is True
+    assert significant is True
+    assert row["card_id"] == "swsh1-1"
+    assert row["price_type"] == "normal"
+    assert row["market"] == 5.0
+    assert row["low"] == 4.0
+    assert row["trend_1d"] == 0.0
+
+
+def test_update_card_price_negligible_diff_is_unchanged():
+    current = {"market": 5.00}
+    changed, significant, _ = update_card_price(current, "swsh1-1", "normal", {"market": 5.005})
+
+    assert changed is False
+    assert significant is False
+
+
+def test_update_card_price_small_change_not_significant():
+    current = {"market": 5.00}
+    # ~2% change, well under $0.50 -> changed but not significant
+    changed, significant, _ = update_card_price(current, "swsh1-1", "normal", {"market": 5.10})
+
+    assert changed is True
+    assert significant is False
+
+
+def test_update_card_price_large_percent_change_is_significant():
+    current = {"market": 5.00}
+    # +20% -> significant
+    changed, significant, _ = update_card_price(current, "swsh1-1", "normal", {"market": 6.00})
+
+    assert changed is True
+    assert significant is True
+
+
+def test_update_card_price_large_flat_change_is_significant():
+    current = {"market": 0.0}
+    # From $0 to $0.60 -> flat change >= $0.50 -> significant
+    changed, significant, _ = update_card_price(current, "swsh1-1", "normal", {"market": 0.60})
+
+    assert changed is True
+    assert significant is True
+
+
+def test_extract_prices_tcgplayer_only():
+    pricing = {
+        "tcgplayer": {
+            "normal": {"marketPrice": 1.5, "lowPrice": 1.0, "midPrice": 1.2, "highPrice": 2.0, "directLowPrice": 1.1}
+        }
+    }
+    prices = _extract_prices_found(pricing)
+
+    assert set(prices.keys()) == {"normal"}
+    assert prices["normal"]["market"] == 1.5
+    assert prices["normal"]["avg"] == 0.0
+
+
+def test_extract_prices_flat_cardmarket_synthesizes_normal_variant():
+    """When TCGPlayer is null, a flat Cardmarket object should produce a 'normal' variant."""
+    pricing = {
+        "tcgplayer": None,
+        "cardmarket": {"avg": 2.5, "low": 1.0, "trend": 2.6, "avg1": 2.4, "avg7": 2.3, "avg30": 2.2},
+    }
+    prices = _extract_prices_found(pricing)
+
+    assert set(prices.keys()) == {"normal"}
+    assert prices["normal"]["avg"] == 2.5
+    assert prices["normal"]["low"] == 1.0
+    assert prices["normal"]["trend_30d"] == 2.2
+
+
+def test_extract_prices_nested_cardmarket_merges_into_existing_variant():
+    pricing = {
+        "tcgplayer": {"holofoil": {"marketPrice": 10.0, "lowPrice": 8.0, "midPrice": 9.0, "highPrice": 12.0}},
+        "cardmarket": {"holofoil": {"avg": 9.5, "low": 7.5, "trend": 9.6, "avg1": 9.4, "avg7": 9.3, "avg30": 9.2}},
+    }
+    prices = _extract_prices_found(pricing)
+
+    assert set(prices.keys()) == {"holofoil"}
+    assert prices["holofoil"]["market"] == 10.0
+    assert prices["holofoil"]["avg"] == 9.5
+    # TCGPlayer low (8.0) takes precedence since it's non-zero
+    assert prices["holofoil"]["low"] == 8.0

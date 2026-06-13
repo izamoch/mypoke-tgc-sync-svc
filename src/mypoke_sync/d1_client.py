@@ -182,7 +182,9 @@ async def _run_statement_batches(table: str, statements: list[dict], statements_
         batch = statements[i : i + statements_per_request]
         try:
             results = await d1_raw_batch(batch)
-            rows_written += sum(r.get("meta", {}).get("rows_written", r.get("meta", {}).get("changes", 0)) for r in results)
+            rows_written += sum(
+                r.get("meta", {}).get("rows_written", r.get("meta", {}).get("changes", 0)) for r in results
+            )
         except Exception as e:
             msg = f"{table} batch {i // statements_per_request + 1} failed: {e}"
             logger.error(msg)

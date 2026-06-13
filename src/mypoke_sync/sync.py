@@ -32,20 +32,62 @@ PRICE_BATCH_SIZE = 50
 SET_COLUMNS = ["id", "name", "series", "card_count", "image_url", "release_date", "updated_at"]
 
 CARD_COLUMNS = [
-    "id", "name", "set_id", "image_url", "phash", "dex_id", "rarity", "category",
-    "illustrator", "hp", "types", "stage", "suffix", "attacks", "weaknesses",
-    "retreat", "regulation_mark", "legal", "flavor_text", "evolutions", "updated_at",
+    "id",
+    "name",
+    "set_id",
+    "image_url",
+    "phash",
+    "dex_id",
+    "rarity",
+    "category",
+    "illustrator",
+    "hp",
+    "types",
+    "stage",
+    "suffix",
+    "attacks",
+    "weaknesses",
+    "retreat",
+    "regulation_mark",
+    "legal",
+    "flavor_text",
+    "evolutions",
+    "updated_at",
 ]
 
 # Metadata fields that get backfilled/refreshed during price sync.
 CARD_BACKFILL_COLUMNS = [
-    "dex_id", "rarity", "category", "illustrator", "hp", "types", "stage", "suffix",
-    "attacks", "weaknesses", "retreat", "regulation_mark", "legal", "flavor_text", "evolutions",
+    "dex_id",
+    "rarity",
+    "category",
+    "illustrator",
+    "hp",
+    "types",
+    "stage",
+    "suffix",
+    "attacks",
+    "weaknesses",
+    "retreat",
+    "regulation_mark",
+    "legal",
+    "flavor_text",
+    "evolutions",
 ]
 
 PRICE_COLUMNS = [
-    "card_id", "price_type", "market", "low", "mid", "high", "direct", "avg",
-    "trend", "trend_1d", "trend_7d", "trend_30d", "updated_at",
+    "card_id",
+    "price_type",
+    "market",
+    "low",
+    "mid",
+    "high",
+    "direct",
+    "avg",
+    "trend",
+    "trend_1d",
+    "trend_7d",
+    "trend_30d",
+    "updated_at",
 ]
 
 # Pushdown of the Smart Sync candidate selection: one row per card with its
@@ -358,8 +400,16 @@ def _extract_prices_found(pricing: dict) -> dict[str, dict]:
                 # Create generic variant entry if TCGPlayer missed it or not in found
                 if variant not in prices_found:
                     prices_found[variant] = {
-                        "market": 0.0, "low": 0.0, "mid": 0.0, "high": 0.0, "direct": 0.0,
-                        "avg": 0.0, "trend": 0.0, "trend_1d": 0.0, "trend_7d": 0.0, "trend_30d": 0.0,
+                        "market": 0.0,
+                        "low": 0.0,
+                        "mid": 0.0,
+                        "high": 0.0,
+                        "direct": 0.0,
+                        "avg": 0.0,
+                        "trend": 0.0,
+                        "trend_1d": 0.0,
+                        "trend_7d": 0.0,
+                        "trend_30d": 0.0,
                     }
 
                 prices_found[variant].update(
@@ -378,8 +428,16 @@ def _extract_prices_found(pricing: dict) -> dict[str, dict]:
             # If TCGPlayer was null, synthesize a 'normal' variant to hold the data.
             if not prices_found:
                 prices_found["normal"] = {
-                    "market": 0.0, "low": 0.0, "mid": 0.0, "high": 0.0, "direct": 0.0,
-                    "avg": 0.0, "trend": 0.0, "trend_1d": 0.0, "trend_7d": 0.0, "trend_30d": 0.0,
+                    "market": 0.0,
+                    "low": 0.0,
+                    "mid": 0.0,
+                    "high": 0.0,
+                    "direct": 0.0,
+                    "avg": 0.0,
+                    "trend": 0.0,
+                    "trend_1d": 0.0,
+                    "trend_7d": 0.0,
+                    "trend_30d": 0.0,
                 }
 
             # Update all variants found (usually 'normal' or 'unlimited') with the flat data

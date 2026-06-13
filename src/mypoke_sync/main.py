@@ -172,7 +172,7 @@ def generate_report(start_time: datetime, end_time: datetime, cards_metrics: dic
             logger.error(f"Failed to send webhook to {webhook_url}: {e}")
 
 
-async def run_sync_job(force_prices: bool = False):
+async def run_sync_job(force_prices: bool = False, card_limit: int | None = None):
     """
     Main entry point for the scheduled synchronization job.
     """
@@ -180,9 +180,7 @@ async def run_sync_job(force_prices: bool = False):
     logger.info(f"Starting scheduled PokeTCG Sync Job at {start_time} (UTC)")
 
     if not d1_client.is_configured():
-        logger.error(
-            "CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN and D1_DATABASE_ID must be set. Aborting."
-        )
+        logger.error("CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_API_TOKEN and D1_DATABASE_ID must be set. Aborting.")
         return
 
     sync.start_sync_flag()
@@ -192,7 +190,7 @@ async def run_sync_job(force_prices: bool = False):
     try:
         # Step 1: Sync Sets and New Cards
         logger.info("Executing Phase 1: Sets and Cards synchronization...")
-        cards_metrics = await sync.sync_sets_and_cards()
+        cards_metrics = await sync.sync_sets_and_cards(card_limit=card_limit)
 
         if sync.SHOULD_STOP:
             logger.warning("Sync stopped prematurely during Cards phase. Exiting.")
@@ -216,11 +214,12 @@ async def run_sync_job(force_prices: bool = False):
 def main():
     parser = argparse.ArgumentParser(description="Pokemon TCG Backend Synchronization Job")
     parser.add_argument("--force-prices", action="store_true", help="Force price sync regardless of temperature")
+    parser.add_argument("--card-limit", type=int, default=None, help="Limit number of new cards to process")
     args = parser.parse_args()
 
     logger.info("Initializing Sync Job environment...")
     try:
-        asyncio.run(run_sync_job(force_prices=args.force_prices))
+        asyncio.run(run_sync_job(force_prices=args.force_prices, card_limit=args.card_limit))
     except KeyboardInterrupt:
         logger.info("Sync Job interrupted by user.")
         sys.exit(0)

@@ -1,8 +1,8 @@
-import httpx
-from PIL import Image
-import imagehash
 import io
-import os
+
+import httpx
+import imagehash
+from PIL import Image
 
 
 async def calculate_phash(image_url: str) -> str:

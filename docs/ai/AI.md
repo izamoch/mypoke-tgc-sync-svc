@@ -10,10 +10,13 @@ Bienvenida, IA. Este servicio es crítico para que la app móvil tenga datos fre
 - No existe SQLite local ni SQLAlchemy: `database.py`, `models.py` y `/data/` fueron eliminados.
 
 ## 🛠️ Tareas Pendientes
-- [ ] Implementar un retry-exponential-backoff para las peticiones a PokéAPI (a veces falla por rate limit).
-- [ ] Evaluar si conviene exponer `card_limit` por CLI para correr barridos iniciales acotados.
+- [x] Implementar un retry-exponential-backoff para las peticiones a PokéAPI (implementado en `pokeapi_client.py` con `with_async_retry`).
+- [x] Evaluar si conviene exponer `card_limit` por CLI para correr barridos iniciales acotados (implementado e integrado en `main.py`).
 
 ## 📊 Últimos Cambios
+- [2026-06-13]: **Migraciones e índices aplicados en D1 y CLI expandido.**
+  - Ejecutadas con éxito las migraciones de índices en el D1 de producción (`0001_performance_indexes.sql`), incluyendo la creación del índice de cobertura de Smart Sync (`idx_card_prices_covering_sync`) y la eliminación del índice redundante `idx_card_prices_card_id` para reducir operaciones de lectura/escritura (ahorro del plan gratuito).
+  - Añadido el parámetro `--card-limit` a la CLI para limitar el procesamiento de cartas nuevas en barridos iniciales.
 - [2026-06-13]: **Sync directo a D1 vía REST API (ADR 007).**
   - Eliminados `database.py`, `models.py`, `/data/` y la dependencia `sqlalchemy` — D1 es la única fuente de la verdad.
   - Eliminado el push vía Worker (`POST {WORKER_URL}/sync/update`, `WORKER_URL`, `ADMIN_TOKEN`).

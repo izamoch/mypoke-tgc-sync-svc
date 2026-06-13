@@ -99,9 +99,7 @@ async def test_retries_on_5xx_then_succeeds(monkeypatch):
     def handler(request):
         if next(statuses) == 500:
             return httpx.Response(500, json={"success": False, "errors": [{"message": "boom"}]})
-        return httpx.Response(
-            200, json={"success": True, "errors": [], "result": [{"results": [], "success": True}]}
-        )
+        return httpx.Response(200, json={"success": True, "errors": [], "result": [{"results": [], "success": True}]})
 
     _install_transport(monkeypatch, handler)
 
@@ -145,8 +143,7 @@ async def test_chunked_upsert_builds_sql_for_single_statement(monkeypatch):
     batch = requests_bodies[0]["batch"]
     assert len(batch) == 1
     assert batch[0]["sql"] == (
-        "INSERT INTO cards (id, name) VALUES (?, ?), (?, ?), (?, ?) "
-        "ON CONFLICT(id) DO UPDATE SET name=excluded.name"
+        "INSERT INTO cards (id, name) VALUES (?, ?), (?, ?), (?, ?) ON CONFLICT(id) DO UPDATE SET name=excluded.name"
     )
     assert batch[0]["params"] == ["c0", "Card 0", "c1", "Card 1", "c2", "Card 2"]
 

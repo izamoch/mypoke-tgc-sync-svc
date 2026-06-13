@@ -1,8 +1,11 @@
-import httpx
 import logging
+
+import httpx
+
 from mypoke_sync.utils.retry import with_async_retry
 
 logger = logging.getLogger(__name__)
+
 
 async def fetch_pokeapi_data(dex_id: int):
     """
@@ -21,46 +24,38 @@ async def fetch_pokeapi_data(dex_id: int):
 
             # 1. Fetch Species Data with retry
             data = await with_async_retry(
-                get_json, 
-                f"https://pokeapi.co/api/v2/pokemon-species/{dex_id}",
-                max_retries=3,
-                base_delay=2.0
+                get_json, f"https://pokeapi.co/api/v2/pokemon-species/{dex_id}", max_retries=3, base_delay=2.0
             )
-            
+
             if not data:
                 return None, None
-            
+
             # Extract English Flavor Text
             flavor_text = ""
             for entry in data.get("flavor_text_entries", []):
                 if entry.get("language", {}).get("name") == "en":
                     flavor_text = entry.get("flavor_text", "").replace("\n", " ").replace("\f", " ")
                     break
-            
+
             # 2. Fetch Evolution Chain
             evo_url = data.get("evolution_chain", {}).get("url")
             evolutions = []
             if evo_url:
                 # Fetch evolution chain data with retry
-                evo_data = await with_async_retry(
-                    get_json,
-                    evo_url,
-                    max_retries=2,
-                    base_delay=2.0
-                )
-                
+                evo_data = await with_async_retry(get_json, evo_url, max_retries=2, base_delay=2.0)
+
                 if evo_data:
                     chain = evo_data.get("chain", {})
-                    
+
                     def traverse_chain(node):
                         species_name = node.get("species", {}).get("name")
                         if species_name:
                             evolutions.append(species_name.capitalize())
                         for evolves_into in node.get("evolves_to", []):
                             traverse_chain(evolves_into)
-                    
+
                     traverse_chain(chain)
-            
+
             return flavor_text, evolutions
 
         except httpx.HTTPStatusError as e:

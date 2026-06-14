@@ -22,9 +22,10 @@ async def _fake_pokeapi(*args, **kwargs):
     return "Flavor text", ["Evolution"]
 
 
-async def test_sync_sets_and_cards_inserts_new_set_and_card(monkeypatch):
+async def test_sync_sets_and_cards_inserts_new_set_and_card(monkeypatch, tmp_path):
     monkeypatch.setattr(sync, "calculate_phash", _fake_phash)
     monkeypatch.setattr(sync, "fetch_pokeapi_data", _fake_pokeapi)
+    monkeypatch.setattr(sync.local_index, "DEFAULT_DB_PATH", str(tmp_path / "local_index.sqlite"))
     sync.start_sync_flag()
 
     sets_summary = [
@@ -100,13 +101,16 @@ async def test_sync_sets_and_cards_inserts_new_set_and_card(monkeypatch):
     assert card_row["phash"] == "fakephash"
 
 
-async def test_sync_prices_updates_card_and_inserts_price(monkeypatch):
+async def test_sync_prices_updates_card_and_inserts_price(monkeypatch, tmp_path):
     monkeypatch.setattr(sync, "fetch_pokeapi_data", _fake_pokeapi)
+    monkeypatch.setattr(sync.local_index, "DEFAULT_DB_PATH", str(tmp_path / "local_index.sqlite"))
     sync.start_sync_flag()
 
     card_detail = {
         "id": "base1-1",
         "dexId": [65],
+        "rarity": "Rare Holo",
+        "category": "Pokemon",
         "pricing": {
             "tcgplayer": {
                 "normal": {
@@ -129,12 +133,12 @@ async def test_sync_prices_updates_card_and_inserts_price(monkeypatch):
 
     async def fake_d1_query(sql, params=None):
         if "max_market" in sql:
-            # Card never checked -> NEW, always scheduled regardless of force_prices
-            return [{"id": "base1-1", "updated_at": None, "max_market": 0.0}]
+            # Seed query: card never checked -> NEW, always scheduled regardless of force_prices
+            return [{"id": "base1-1", "updated_at": None, "needs_backfill": 1, "max_market": 0.0}]
+        if "FROM card_prices" in sql:
+            return []
         if "FROM cards WHERE id IN" in sql:
             return [{"id": "base1-1", **dict.fromkeys(sync.CARD_BACKFILL_COLUMNS)}]
-        if "FROM card_prices WHERE card_id IN" in sql:
-            return []
         raise AssertionError(f"unexpected query: {sql}")
 
     updates = []
@@ -162,8 +166,7 @@ async def test_sync_prices_updates_card_and_inserts_price(monkeypatch):
     assert result["error_list"] == []
     assert result["d1_errors"] == []
 
-    cards_update = updates[0]
-    assert cards_update[0] == "cards"
+    cards_update = next(u for u in updates if u[0] == "cards" and "dex_id" in u[1])
     assert cards_update[2] == "id"
     updated_row = cards_update[3][0]
     assert updated_row["id"] == "base1-1"
@@ -177,3 +180,25 @@ async def test_sync_prices_updates_card_and_inserts_price(monkeypatch):
     assert price_row["card_id"] == "base1-1"
     assert price_row["price_type"] == "normal"
     assert price_row["market"] == 5.0
+
+    # The local index should now reflect this card as checked, backfilled,
+    # and with its price checksum recorded - so a second run with the same
+    # price data makes no D1 calls for `card_prices` or `cards` reads.
+    upserts.clear()
+    updates.clear()
+    second_call_queries = []
+
+    async def fake_d1_query_second(sql, params=None):
+        second_call_queries.append(sql)
+        raise AssertionError(f"unexpected D1 read on second run: {sql}")
+
+    monkeypatch.setattr(sync.d1_client, "d1_query", fake_d1_query_second)
+
+    result2 = await sync.sync_prices(force_prices=True)
+
+    assert result2["updated_count"] == 0
+    assert second_call_queries == []
+    # Only the "touch updated_at" cards update should happen, no card_prices upsert
+    assert upserts == []
+    cards_touch = next(u for u in updates if u[0] == "cards")
+    assert cards_touch[1] == ["updated_at"]

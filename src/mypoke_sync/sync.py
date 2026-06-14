@@ -9,7 +9,7 @@ from typing import Any
 
 import httpx
 
-from . import d1_client
+from . import d1_client, local_index
 from .pokeapi_client import fetch_pokeapi_data
 from .utils.phash import calculate_phash
 from .validator import validate_card_data, validate_price_data, validate_set_data
@@ -90,16 +90,6 @@ PRICE_COLUMNS = [
     "updated_at",
 ]
 
-# Pushdown of the Smart Sync candidate selection: one row per card with its
-# last check time and the highest market price across "current" variants.
-CANDIDATE_QUERY = """
-SELECT c.id, c.updated_at, COALESCE(MAX(cp.market), 0.0) AS max_market
-FROM cards c
-LEFT JOIN card_prices cp
-  ON cp.card_id = c.id AND cp.price_type NOT IN ('holo', 'reverse', 'firstEdition')
-GROUP BY c.id, c.updated_at
-"""
-
 
 @dataclass
 class Card:
@@ -166,6 +156,14 @@ def stop_sync():
 def start_sync_flag():
     global SHOULD_STOP
     SHOULD_STOP = False
+
+
+async def _flush_new_cards(cards_payload: list[dict], metrics: dict) -> None:
+    """Upserts a batch of new cards to D1 and, on success, registers them in the local index."""
+    result = await d1_client.chunked_upsert("cards", CARD_COLUMNS, ["id"], cards_payload)
+    metrics["d1_errors"].extend(result["errors"])
+    if not result["errors"]:
+        local_index.register_new_cards([row["id"] for row in cards_payload])
 
 
 async def sync_sets_and_cards(card_limit: int | None = None) -> dict:
@@ -325,8 +323,7 @@ async def sync_sets_and_cards(card_limit: int | None = None) -> dict:
                     metrics["new_cards"] += 1
 
                     if len(cards_payload) >= CARD_PUSH_BATCH_SIZE:
-                        result = await d1_client.chunked_upsert("cards", CARD_COLUMNS, ["id"], cards_payload)
-                        metrics["d1_errors"].extend(result["errors"])
+                        await _flush_new_cards(cards_payload, metrics)
                         cards_payload = []
 
                 except Exception as e:
@@ -334,8 +331,7 @@ async def sync_sets_and_cards(card_limit: int | None = None) -> dict:
                     metrics["errors"].append(f"Card {card_summary['id']} error: {e!r}")
 
             if cards_payload:
-                result = await d1_client.chunked_upsert("cards", CARD_COLUMNS, ["id"], cards_payload)
-                metrics["d1_errors"].extend(result["errors"])
+                await _flush_new_cards(cards_payload, metrics)
 
         except Exception as e:
             logger.exception("Cards list sync error")
@@ -480,10 +476,29 @@ def _backfill_card_fields(update_row: dict, details: dict) -> None:
         update_row["legal"] = json.dumps(details.get("legal")) if details.get("legal") else None
 
 
+def _build_price_row(card_id: str, variant: str, vals: dict) -> dict:
+    """Builds the full card_prices row dict (ready for chunked_upsert) from freshly fetched `vals`."""
+    return {
+        "card_id": card_id,
+        "price_type": variant,
+        "market": vals.get("market", 0.0),
+        "low": vals.get("low", 0.0),
+        "mid": vals.get("mid", 0.0),
+        "high": vals.get("high", 0.0),
+        "direct": vals.get("direct", 0.0),
+        "avg": vals.get("avg", 0.0),
+        "trend": vals.get("trend", 0.0),
+        "trend_1d": vals.get("trend_1d", 0.0),
+        "trend_7d": vals.get("trend_7d", 0.0),
+        "trend_30d": vals.get("trend_30d", 0.0),
+        "updated_at": datetime.datetime.utcnow().isoformat(),
+    }
+
+
 def update_card_price(current: dict | None, card_id: str, variant: str, vals: dict) -> tuple[bool, bool, dict]:
     """
     Compares `vals` (freshly fetched prices) against `current` (the existing
-    card_prices row from D1, or None if the variant doesn't exist yet).
+    card_prices row, or None if the variant doesn't exist yet).
 
     Returns (any_changed, is_significant, new_row):
       - any_changed: True if the market price differs by > $0.01, or the row is new.
@@ -492,16 +507,6 @@ def update_card_price(current: dict | None, card_id: str, variant: str, vals: di
       - new_row: the full card_prices row dict ready for chunked_upsert.
     """
     market = vals.get("market", 0.0)
-    low = vals.get("low", 0.0)
-    mid = vals.get("mid", 0.0)
-    high = vals.get("high", 0.0)
-    direct = vals.get("direct", 0.0)
-    avg = vals.get("avg", 0.0)
-    trend = vals.get("trend", 0.0)
-    trend_1d = vals.get("trend_1d", 0.0)
-    trend_7d = vals.get("trend_7d", 0.0)
-    trend_30d = vals.get("trend_30d", 0.0)
-
     any_changed = False
     is_significant = False
 
@@ -522,45 +527,198 @@ def update_card_price(current: dict | None, card_id: str, variant: str, vals: di
             elif market_diff >= 0.50:
                 is_significant = True
 
-    new_row = {
-        "card_id": card_id,
-        "price_type": variant,
-        "market": market,
-        "low": low,
-        "mid": mid,
-        "high": high,
-        "direct": direct,
-        "avg": avg,
-        "trend": trend,
-        "trend_1d": trend_1d,
-        "trend_7d": trend_7d,
-        "trend_30d": trend_30d,
-        "updated_at": datetime.datetime.utcnow().isoformat(),
-    }
-
-    return any_changed, is_significant, new_row
+    return any_changed, is_significant, _build_price_row(card_id, variant, vals)
 
 
-async def sync_prices(force_prices: bool = False) -> dict:
+async def _enrich_card_lore(update_row: dict, pokeapi_cache: dict[int, tuple[str, str | None]]) -> None:
+    """Fills in flavor_text/evolutions from PokéAPI, once per unique Dex ID."""
+    if not update_row.get("dex_id") or update_row.get("flavor_text") is not None:
+        return
+
+    dex_id = update_row["dex_id"]
+    if dex_id not in pokeapi_cache:
+        logger.info(f"Enriching Dex ID {dex_id} from PokéAPI...")
+        flavor, evos = await fetch_pokeapi_data(dex_id)
+        pokeapi_cache[dex_id] = (flavor or "", json.dumps(evos) if evos else None)
+
+    flavor_text, evolutions = pokeapi_cache[dex_id]
+    update_row["flavor_text"] = flavor_text
+    if evolutions:
+        update_row["evolutions"] = evolutions
+
+
+def _process_card_prices(
+    cid: str,
+    pricing: dict,
+    price_checksums: dict[tuple[str, str], str],
+    prices_payload: list[dict],
+    new_checksums_by_key: dict[tuple[str, str], str],
+    stats: dict[str, dict],
+) -> tuple[int, float]:
+    """Compares each price variant's checksum against the local index.
+
+    Returns (updated_count, max_market across "current" variants).
     """
-    Updates prices for cards based on the Smart Sync temperature/hashing strategy.
+    updated = 0
+    card_max_market = 0.0
+    for variant, p_vals in _extract_prices_found(pricing).items():
+        price_val_data = {
+            "card_id": cid,
+            "market": p_vals.get("market"),
+            "low": p_vals.get("low"),
+            "mid": p_vals.get("mid"),
+            "high": p_vals.get("high"),
+            "direct": p_vals.get("direct"),
+            "avg": p_vals.get("avg"),
+            "trend": p_vals.get("trend"),
+        }
+        if not validate_price_data(price_val_data):
+            logger.warning(f"Skipping price record for card {cid} variant {variant} due to validation failure.")
+            continue
+
+        if variant not in local_index.NON_CURRENT_PRICE_TYPES:
+            card_max_market = max(card_max_market, float(p_vals.get("market") or 0.0))
+
+        new_checksum = local_index.price_checksum(p_vals)
+        new_checksums_by_key[(cid, variant)] = new_checksum
+
+        if price_checksums.get((cid, variant)) != new_checksum:
+            prices_payload.append(_build_price_row(cid, variant, p_vals))
+            updated += 1
+            stats["variant_updates"][variant] = stats["variant_updates"].get(variant, 0) + 1
+
+    return updated, card_max_market
+
+
+async def _process_price_card_result(
+    cid: str,
+    response: httpx.Response,
+    *,
+    cards_by_id: dict[str, dict],
+    price_checksums: dict[tuple[str, str], str],
+    pokeapi_cache: dict[int, tuple[str, str | None]],
+    cards_full_payload: list[dict],
+    cards_touch_payload: list[dict],
+    prices_payload: list[dict],
+    checked_at_by_card: dict[str, str],
+    backfilled_card_ids: list[str],
+    new_checksums_by_key: dict[tuple[str, str], str],
+    max_market_by_card: dict[str, float],
+    stats: dict[str, dict],
+) -> int:
+    """Processes one card's TCGDex response, queuing D1 writes and local-index updates.
+
+    Mutates the payload/lookup dicts in place. Returns the number of price
+    variants that changed (added to `updated_count`).
     """
-    start_time = datetime.datetime.utcnow()
-    logger.info(f"[{start_time}] Starting Price Sync (Smart Strategy)...")
+    now_iso = datetime.datetime.utcnow().isoformat()
+    checked_at_by_card[cid] = now_iso
 
-    rows = await d1_client.d1_query(CANDIDATE_QUERY)
-    total_cards = len(rows)
+    if response.status_code == 404:
+        if cid in cards_by_id:
+            cards_full_payload.append({**cards_by_id[cid], "updated_at": now_iso})
+        else:
+            cards_touch_payload.append({"id": cid, "updated_at": now_iso})
+        return 0
 
+    response.raise_for_status()
+    details = response.json()
+
+    update_row = dict(cards_by_id.get(cid, {"id": cid}))
+    update_row["updated_at"] = now_iso
+
+    pricing = details.get("pricing")
+    if cid in cards_by_id:
+        _backfill_card_fields(update_row, details)
+        await _enrich_card_lore(update_row, pokeapi_cache)
+
+        cards_full_payload.append(update_row)
+        if update_row.get("rarity"):
+            backfilled_card_ids.append(cid)
+    else:
+        cards_touch_payload.append({"id": cid, "updated_at": now_iso})
+
+    if not pricing or not isinstance(pricing, dict):
+        return 0
+
+    updated, card_max_market = _process_card_prices(
+        cid, pricing, price_checksums, prices_payload, new_checksums_by_key, stats
+    )
+    max_market_by_card[cid] = card_max_market
+    return updated
+
+
+def _select_price_check_candidates(rows: list[dict], force_prices: bool) -> tuple[list[str], dict[str, int]]:
+    """Applies the Smart Sync temperature strategy to local-index candidates.
+
+    Returns (card_ids_to_check, strategy_breakdown).
+    """
     card_ids_to_check: list[str] = []
     strat_stats = {"NEW": 0, "PREMIUM": 0, "STANDARD": 0, "STANDARD_SAFETY": 0, "NO_PRICE": 0, "NO_PRICE_SAFETY": 0}
 
     for row in rows:
         temp_card = Card(id=row["id"], updated_at=_parse_dt(row["updated_at"]))
-        strat = determine_check_strategy(temp_card, float(row["max_market"] or 0.0))
+        strat = determine_check_strategy(temp_card, row["max_market"])
         if force_prices or strat != "SKIP":
             card_ids_to_check.append(row["id"])
             strat_stats[strat] = strat_stats.get(strat, 0) + 1
 
+    return card_ids_to_check, strat_stats
+
+
+async def _flush_price_batch_writes(
+    cards_full_payload: list[dict],
+    cards_touch_payload: list[dict],
+    prices_payload: list[dict],
+    checked_at_by_card: dict[str, str],
+    backfilled_card_ids: list[str],
+    new_checksums_by_key: dict[tuple[str, str], str],
+    max_market_by_card: dict[str, float],
+    d1_errors: list[str],
+) -> None:
+    """Writes a price-sync batch to D1 and, if all writes succeed, updates the local index."""
+    d1_write_ok = True
+
+    if cards_full_payload:
+        result = await d1_client.chunked_update(
+            "cards", CARD_BACKFILL_COLUMNS + ["updated_at"], "id", cards_full_payload
+        )
+        d1_errors.extend(result["errors"])
+        d1_write_ok = d1_write_ok and not result["errors"]
+
+    if cards_touch_payload:
+        result = await d1_client.chunked_update("cards", ["updated_at"], "id", cards_touch_payload)
+        d1_errors.extend(result["errors"])
+        d1_write_ok = d1_write_ok and not result["errors"]
+
+    if prices_payload:
+        result = await d1_client.chunked_upsert("card_prices", PRICE_COLUMNS, ["card_id", "price_type"], prices_payload)
+        d1_errors.extend(result["errors"])
+        d1_write_ok = d1_write_ok and not result["errors"]
+
+    if d1_write_ok:
+        local_index.record_check_results(
+            checked_at_by_card, backfilled_card_ids, new_checksums_by_key, max_market_by_card
+        )
+
+
+async def sync_prices(force_prices: bool = False) -> dict:
+    """
+    Updates prices for cards based on the Smart Sync temperature/hashing strategy.
+
+    Candidate selection and price-change detection run against a local SQLite
+    index (see `local_index`) instead of reading `cards`/`card_prices` from D1,
+    since D1 bills/limits on rows read. The index is seeded once from D1 and
+    then kept in sync locally after every successful write.
+    """
+    start_time = datetime.datetime.utcnow()
+    logger.info(f"[{start_time}] Starting Price Sync (Smart Strategy)...")
+
+    await local_index.seed_from_d1()
+    rows = local_index.get_candidates()
+    total_cards = len(rows)
+
+    card_ids_to_check, strat_stats = _select_price_check_candidates(rows, force_prices)
     total_to_check = len(card_ids_to_check)
     logger.info(f"Total Cards: {total_cards}. Scheduled for check: {total_to_check}")
     logger.info(
@@ -592,88 +750,49 @@ async def sync_prices(force_prices: bool = False) -> dict:
             tasks = [_fetch_card_details_concurrent(client, cid, semaphore) for cid in chunk_ids]
             results = await asyncio.gather(*tasks)
 
-            placeholders = ", ".join("?" * len(chunk_ids))
+            # Only cards still missing CARD_BACKFILL_COLUMNS need a D1 read for
+            # their current values (used as the base row before merging fresh data).
+            backfill_ids = [cid for cid in chunk_ids if local_index.needs_backfill(cid)]
+            cards_by_id: dict[str, dict] = {}
+            if backfill_ids:
+                placeholders = ", ".join("?" * len(backfill_ids))
+                cards_rows = await d1_client.d1_query(
+                    f"SELECT id, {', '.join(CARD_BACKFILL_COLUMNS)} FROM cards WHERE id IN ({placeholders})",
+                    backfill_ids,
+                )
+                cards_by_id = {row["id"]: row for row in cards_rows}
 
-            cards_rows = await d1_client.d1_query(
-                f"SELECT id, {', '.join(CARD_BACKFILL_COLUMNS)} FROM cards WHERE id IN ({placeholders})",
-                chunk_ids,
-            )
-            cards_by_id = {row["id"]: row for row in cards_rows}
+            price_checksums = local_index.get_price_checksums(chunk_ids)
 
-            prices_rows = await d1_client.d1_query(
-                f"SELECT card_id, price_type, market FROM card_prices WHERE card_id IN ({placeholders})",
-                chunk_ids,
-            )
-            prices_by_key = {(row["card_id"], row["price_type"]): row for row in prices_rows}
-
-            cards_update_payload: list[dict] = []
+            cards_full_payload: list[dict] = []
+            cards_touch_payload: list[dict] = []
             prices_payload: list[dict] = []
+            checked_at_by_card: dict[str, str] = {}
+            backfilled_card_ids: list[str] = []
+            new_checksums_by_key: dict[tuple[str, str], str] = {}
+            max_market_by_card: dict[str, float] = {}
 
             for cid, response, err in results:
-                card_row = cards_by_id.get(cid)
-                if not card_row:
-                    continue
-
                 checked_count += 1
-                now_iso = datetime.datetime.utcnow().isoformat()
-
                 try:
                     if err:
                         raise err
 
-                    if response.status_code == 404:
-                        cards_update_payload.append({**card_row, "updated_at": now_iso})
-                        continue
-
-                    response.raise_for_status()
-                    details = response.json()
-
-                    update_row = dict(card_row)
-                    update_row["updated_at"] = now_iso
-                    cards_update_payload.append(update_row)
-
-                    pricing = details.get("pricing")
-                    if not pricing or not isinstance(pricing, dict):
-                        continue
-
-                    prices_found = _extract_prices_found(pricing)
-                    _backfill_card_fields(update_row, details)
-
-                    # Lore Enrichment (PokéAPI) - once per unique Dex ID
-                    if update_row.get("dex_id") and update_row.get("flavor_text") is None:
-                        dex_id = update_row["dex_id"]
-                        if dex_id not in pokeapi_cache:
-                            logger.info(f"Enriching Dex ID {dex_id} from PokéAPI...")
-                            flavor, evos = await fetch_pokeapi_data(dex_id)
-                            pokeapi_cache[dex_id] = (flavor or "", json.dumps(evos) if evos else None)
-                        flavor_text, evolutions = pokeapi_cache[dex_id]
-                        update_row["flavor_text"] = flavor_text
-                        if evolutions:
-                            update_row["evolutions"] = evolutions
-
-                    for variant, p_vals in prices_found.items():
-                        price_val_data = {
-                            "card_id": cid,
-                            "market": p_vals.get("market"),
-                            "low": p_vals.get("low"),
-                            "mid": p_vals.get("mid"),
-                            "high": p_vals.get("high"),
-                            "direct": p_vals.get("direct"),
-                            "avg": p_vals.get("avg"),
-                            "trend": p_vals.get("trend"),
-                        }
-                        if not validate_price_data(price_val_data):
-                            logger.warning(
-                                f"Skipping price record for card {cid} variant {variant} due to validation failure."
-                            )
-                            continue
-
-                        current = prices_by_key.get((cid, variant))
-                        changed, _, new_row = update_card_price(current, cid, variant, p_vals)
-                        if changed:
-                            updated_count += 1
-                            stats["variant_updates"][variant] = stats["variant_updates"].get(variant, 0) + 1
-                            prices_payload.append(new_row)
+                    updated_count += await _process_price_card_result(
+                        cid,
+                        response,
+                        cards_by_id=cards_by_id,
+                        price_checksums=price_checksums,
+                        pokeapi_cache=pokeapi_cache,
+                        cards_full_payload=cards_full_payload,
+                        cards_touch_payload=cards_touch_payload,
+                        prices_payload=prices_payload,
+                        checked_at_by_card=checked_at_by_card,
+                        backfilled_card_ids=backfilled_card_ids,
+                        new_checksums_by_key=new_checksums_by_key,
+                        max_market_by_card=max_market_by_card,
+                        stats=stats,
+                    )
 
                 except Exception as e:
                     err_type = type(e).__name__
@@ -681,17 +800,16 @@ async def sync_prices(force_prices: bool = False) -> dict:
                     if len(errors) < 50:
                         errors.append(f"{cid}: {e!r}")
 
-            if cards_update_payload:
-                result = await d1_client.chunked_update(
-                    "cards", CARD_BACKFILL_COLUMNS + ["updated_at"], "id", cards_update_payload
-                )
-                d1_errors.extend(result["errors"])
-
-            if prices_payload:
-                result = await d1_client.chunked_upsert(
-                    "card_prices", PRICE_COLUMNS, ["card_id", "price_type"], prices_payload
-                )
-                d1_errors.extend(result["errors"])
+            await _flush_price_batch_writes(
+                cards_full_payload,
+                cards_touch_payload,
+                prices_payload,
+                checked_at_by_card,
+                backfilled_card_ids,
+                new_checksums_by_key,
+                max_market_by_card,
+                d1_errors,
+            )
 
             percent = (checked_count / total_to_check) * 100 if total_to_check else 100.0
             logger.info(f"Progress: {checked_count}/{total_to_check} ({percent:.1f}%) - Updates: {updated_count}")

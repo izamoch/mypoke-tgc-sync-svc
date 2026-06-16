@@ -598,7 +598,6 @@ async def _process_price_card_result(
     price_checksums: dict[tuple[str, str], str],
     pokeapi_cache: dict[int, tuple[str, str | None]],
     cards_full_payload: list[dict],
-    cards_touch_payload: list[dict],
     prices_payload: list[dict],
     checked_at_by_card: dict[str, str],
     backfilled_card_ids: list[str],
@@ -610,33 +609,34 @@ async def _process_price_card_result(
 
     Mutates the payload/lookup dicts in place. Returns the number of price
     variants that changed (added to `updated_count`).
+
+    updated_at is only queued when backfill content actually changes (the SQL
+    WHERE guard in chunked_update enforces this at the DB level too). Cards with
+    no data changes are not added to any D1 write payload.
     """
     now_iso = datetime.datetime.utcnow().isoformat()
     checked_at_by_card[cid] = now_iso
 
     if response.status_code == 404:
+        # On 404, backfill with current DB values so the conditional UPDATE has
+        # content columns to compare against (no-op if nothing changed).
         if cid in cards_by_id:
             cards_full_payload.append({**cards_by_id[cid], "updated_at": now_iso})
-        else:
-            cards_touch_payload.append({"id": cid, "updated_at": now_iso})
+        # Cards not in cards_by_id have no backfill pending — skip entirely.
         return 0
 
     response.raise_for_status()
     details = response.json()
 
-    update_row = dict(cards_by_id.get(cid, {"id": cid}))
-    update_row["updated_at"] = now_iso
-
     pricing = details.get("pricing")
     if cid in cards_by_id:
+        update_row = dict(cards_by_id[cid])
+        update_row["updated_at"] = now_iso
         _backfill_card_fields(update_row, details)
         await _enrich_card_lore(update_row, pokeapi_cache)
-
         cards_full_payload.append(update_row)
         if update_row.get("rarity"):
             backfilled_card_ids.append(cid)
-    else:
-        cards_touch_payload.append({"id": cid, "updated_at": now_iso})
 
     if not pricing or not isinstance(pricing, dict):
         return 0
@@ -668,7 +668,6 @@ def _select_price_check_candidates(rows: list[dict], force_prices: bool) -> tupl
 
 async def _flush_price_batch_writes(
     cards_full_payload: list[dict],
-    cards_touch_payload: list[dict],
     prices_payload: list[dict],
     checked_at_by_card: dict[str, str],
     backfilled_card_ids: list[str],
@@ -676,23 +675,35 @@ async def _flush_price_batch_writes(
     max_market_by_card: dict[str, float],
     d1_errors: list[str],
 ) -> None:
-    """Writes a price-sync batch to D1 and, if all writes succeed, updates the local index."""
+    """Writes a price-sync batch to D1 and, if all writes succeed, updates the local index.
+
+    updated_at is only written to D1 when content actually changes:
+    - cards: only when at least one CARD_BACKFILL_COLUMNS value differs.
+    - card_prices: only when at least one price/trend column differs.
+    Cards with no data changes are skipped entirely (no touch update).
+    """
     d1_write_ok = True
 
     if cards_full_payload:
         result = await d1_client.chunked_update(
-            "cards", CARD_BACKFILL_COLUMNS + ["updated_at"], "id", cards_full_payload
+            "cards",
+            CARD_BACKFILL_COLUMNS + ["updated_at"],
+            "id",
+            cards_full_payload,
+            condition_columns=CARD_BACKFILL_COLUMNS,
         )
         d1_errors.extend(result["errors"])
         d1_write_ok = d1_write_ok and not result["errors"]
 
-    if cards_touch_payload:
-        result = await d1_client.chunked_update("cards", ["updated_at"], "id", cards_touch_payload)
-        d1_errors.extend(result["errors"])
-        d1_write_ok = d1_write_ok and not result["errors"]
-
     if prices_payload:
-        result = await d1_client.chunked_upsert("card_prices", PRICE_COLUMNS, ["card_id", "price_type"], prices_payload)
+        price_content_columns = [c for c in PRICE_COLUMNS if c not in ("card_id", "price_type", "updated_at")]
+        result = await d1_client.chunked_upsert(
+            "card_prices",
+            PRICE_COLUMNS,
+            ["card_id", "price_type"],
+            prices_payload,
+            condition_columns=price_content_columns,
+        )
         d1_errors.extend(result["errors"])
         d1_write_ok = d1_write_ok and not result["errors"]
 
@@ -765,7 +776,6 @@ async def sync_prices(force_prices: bool = False) -> dict:
             price_checksums = local_index.get_price_checksums(chunk_ids)
 
             cards_full_payload: list[dict] = []
-            cards_touch_payload: list[dict] = []
             prices_payload: list[dict] = []
             checked_at_by_card: dict[str, str] = {}
             backfilled_card_ids: list[str] = []
@@ -785,7 +795,6 @@ async def sync_prices(force_prices: bool = False) -> dict:
                         price_checksums=price_checksums,
                         pokeapi_cache=pokeapi_cache,
                         cards_full_payload=cards_full_payload,
-                        cards_touch_payload=cards_touch_payload,
                         prices_payload=prices_payload,
                         checked_at_by_card=checked_at_by_card,
                         backfilled_card_ids=backfilled_card_ids,
@@ -802,7 +811,6 @@ async def sync_prices(force_prices: bool = False) -> dict:
 
             await _flush_price_batch_writes(
                 cards_full_payload,
-                cards_touch_payload,
                 prices_payload,
                 checked_at_by_card,
                 backfilled_card_ids,

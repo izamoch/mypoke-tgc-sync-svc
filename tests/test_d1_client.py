@@ -208,3 +208,47 @@ async def test_chunked_update_builds_sql_per_row(monkeypatch):
     assert batch[0]["sql"] == "UPDATE cards SET rarity=?, hp=? WHERE id=?"
     assert batch[0]["params"] == ["Rare", 90, "c1"]
     assert batch[1]["params"] == ["Common", 60, "c2"]
+
+
+async def test_chunked_upsert_with_condition_columns(monkeypatch):
+    """condition_columns adds a WHERE guard so unchanged rows are skipped."""
+    requests_bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests_bodies.append(body)
+        return _meta_response([{"rows_written": 1} for _ in body["batch"]])
+
+    _install_transport(monkeypatch, handler)
+
+    columns = ["card_id", "price_type", "market", "updated_at"]
+    rows = [{"card_id": "c1", "price_type": "normal", "market": 5.0, "updated_at": "2026-01-01"}]
+    await d1_client.chunked_upsert(
+        "card_prices", columns, ["card_id", "price_type"], rows, condition_columns=["market"]
+    )
+
+    sql = requests_bodies[0]["batch"][0]["sql"]
+    assert "WHERE market IS NOT excluded.market" in sql
+    assert "ON CONFLICT(card_id, price_type) DO UPDATE SET" in sql
+
+
+async def test_chunked_update_with_condition_columns(monkeypatch):
+    """condition_columns appends AND (<col> IS NOT ?) so unchanged rows are no-ops."""
+    requests_bodies = []
+
+    def handler(request):
+        body = json.loads(request.content)
+        requests_bodies.append(body)
+        return _meta_response([{"changes": 1} for _ in body["batch"]])
+
+    _install_transport(monkeypatch, handler)
+
+    rows = [{"id": "c1", "rarity": "Rare", "hp": 90, "updated_at": "2026-01-01"}]
+    await d1_client.chunked_update(
+        "cards", ["rarity", "hp", "updated_at"], "id", rows, condition_columns=["rarity", "hp"]
+    )
+
+    stmt = requests_bodies[0]["batch"][0]
+    assert stmt["sql"] == "UPDATE cards SET rarity=?, hp=?, updated_at=? WHERE id=? AND (rarity IS NOT ? OR hp IS NOT ?)"
+    # params: set_columns values + where value + condition values
+    assert stmt["params"] == ["Rare", 90, "2026-01-01", "c1", "Rare", 90]

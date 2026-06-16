@@ -115,6 +115,7 @@ async def chunked_upsert(
     conflict_columns: list[str],
     rows: list[dict],
     statements_per_request: int = DEFAULT_STATEMENTS_PER_REQUEST,
+    condition_columns: list[str] | None = None,
 ) -> dict:
     """
     Upserts `rows` into `table` via `INSERT ... ON CONFLICT DO UPDATE SET col=excluded.col`.
@@ -122,6 +123,11 @@ async def chunked_upsert(
     Rows are grouped into multi-row INSERT statements bounded by D1's
     100-bound-parameters-per-statement limit, and multiple statements are
     sent per HTTP request via the /raw batch endpoint.
+
+    If `condition_columns` is given, the DO UPDATE clause is guarded by
+    `WHERE <col> IS NOT excluded.<col> OR ...` so that rows whose content
+    columns are all unchanged are left untouched (preserving updated_at).
+    Uses IS NOT / IS to handle NULL comparisons correctly.
     """
     if not rows:
         return {"rows_written": 0, "errors": []}
@@ -133,14 +139,18 @@ async def chunked_upsert(
     conflict_sql = ", ".join(conflict_columns)
     columns_sql = ", ".join(columns)
 
+    if condition_columns:
+        # Guard: only apply the update when at least one content column differs.
+        where_clause = " OR ".join(f"{c} IS NOT excluded.{c}" for c in condition_columns)
+        on_conflict_sql = f"ON CONFLICT({conflict_sql}) DO UPDATE SET {update_sql} WHERE {where_clause}"
+    else:
+        on_conflict_sql = f"ON CONFLICT({conflict_sql}) DO UPDATE SET {update_sql}"
+
     statements = []
     for i in range(0, len(rows), rows_per_statement):
         chunk = rows[i : i + rows_per_statement]
         values_sql = ", ".join([row_placeholder] * len(chunk))
-        sql = (
-            f"INSERT INTO {table} ({columns_sql}) VALUES {values_sql} "
-            f"ON CONFLICT({conflict_sql}) DO UPDATE SET {update_sql}"
-        )
+        sql = f"INSERT INTO {table} ({columns_sql}) VALUES {values_sql} {on_conflict_sql}"
         params = [row.get(c) for row in chunk for c in columns]
         statements.append({"sql": sql, "params": params})
 
@@ -153,12 +163,18 @@ async def chunked_update(
     where_column: str,
     rows: list[dict],
     statements_per_request: int = DEFAULT_STATEMENTS_PER_REQUEST,
+    condition_columns: list[str] | None = None,
 ) -> dict:
     """
     Updates `rows` in `table` via one `UPDATE ... SET ... WHERE where_column = ?` per row.
 
     Multiple single-row UPDATE statements are sent per HTTP request via the
     /raw batch endpoint.
+
+    If `condition_columns` is given, an extra `AND (<col> IS NOT ? OR ...)` predicate
+    is appended so the UPDATE is a no-op when all content columns are unchanged,
+    leaving updated_at intact. Uses IS NOT / IS for correct NULL handling.
+    Each condition column must also appear in `set_columns` so its value is available.
     """
     if not rows:
         return {"rows_written": 0, "errors": []}
@@ -167,8 +183,17 @@ async def chunked_update(
 
     statements = []
     for row in rows:
-        sql = f"UPDATE {table} SET {set_sql} WHERE {where_column}=?"
-        params = [row.get(c) for c in set_columns] + [row[where_column]]
+        if condition_columns:
+            cond_sql = " OR ".join(f"{c} IS NOT ?" for c in condition_columns)
+            sql = f"UPDATE {table} SET {set_sql} WHERE {where_column}=? AND ({cond_sql})"
+            params = (
+                [row.get(c) for c in set_columns]
+                + [row[where_column]]
+                + [row.get(c) for c in condition_columns]
+            )
+        else:
+            sql = f"UPDATE {table} SET {set_sql} WHERE {where_column}=?"
+            params = [row.get(c) for c in set_columns] + [row[where_column]]
         statements.append({"sql": sql, "params": params})
 
     return await _run_statement_batches(table, statements, statements_per_request)

@@ -99,10 +99,30 @@ class Card:
     updated_at: datetime.datetime | None = None
 
 
+def canonical_now() -> str:
+    """Returns the current UTC time in the canonical `updated_at` format.
+
+    Canonical form: `YYYY-MM-DDTHH:MM:SSZ` (trailing `Z`, no microseconds).
+    Constant length across all rows so SQLite's lexicographic string ordering
+    matches chronological ordering — the client's delta cursor depends on this.
+    """
+    return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def _parse_dt(value: str | None) -> datetime.datetime | None:
+    """Parses an `updated_at` string into a naive UTC datetime.
+
+    Tolerates both the canonical `...Z` form and the legacy microsecond form
+    (without `Z`) so candidate selection keeps working during the backfill.
+    """
     if not value:
         return None
-    return datetime.datetime.fromisoformat(value)
+    # fromisoformat accepts a trailing offset but not a bare "Z" on older
+    # Pythons; normalise it, then drop tzinfo to keep comparisons naive-UTC.
+    dt = datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def determine_check_strategy(card: Card, max_market_price: float = 0.0) -> str:
@@ -181,6 +201,9 @@ async def sync_sets_and_cards(card_limit: int | None = None) -> dict:
     }
     new_sets_count = 0
 
+    # Single server-clock instant for every row touched this run (canonical form).
+    run_ts = canonical_now()
+
     async with httpx.AsyncClient() as client:
         # --- 1. SETS ---
         try:
@@ -210,7 +233,7 @@ async def sync_sets_and_cards(card_limit: int | None = None) -> dict:
                         "card_count": card_count.get("total") if isinstance(card_count, dict) else card_count,
                         "image_url": f"{s.get('logo')}.png" if s.get("logo") else None,
                         "release_date": s.get("releaseDate"),
-                        "updated_at": datetime.datetime.utcnow().isoformat(),
+                        "updated_at": run_ts,
                     }
                 )
                 new_sets_count += 1
@@ -476,8 +499,12 @@ def _backfill_card_fields(update_row: dict, details: dict) -> None:
         update_row["legal"] = json.dumps(details.get("legal")) if details.get("legal") else None
 
 
-def _build_price_row(card_id: str, variant: str, vals: dict) -> dict:
-    """Builds the full card_prices row dict (ready for chunked_upsert) from freshly fetched `vals`."""
+def _build_price_row(card_id: str, variant: str, vals: dict, run_ts: str) -> dict:
+    """Builds the full card_prices row dict (ready for chunked_upsert) from freshly fetched `vals`.
+
+    `run_ts` is the single canonical per-run timestamp; it is only persisted when
+    the conditional upsert's WHERE guard detects an actual price change.
+    """
     return {
         "card_id": card_id,
         "price_type": variant,
@@ -491,11 +518,13 @@ def _build_price_row(card_id: str, variant: str, vals: dict) -> dict:
         "trend_1d": vals.get("trend_1d", 0.0),
         "trend_7d": vals.get("trend_7d", 0.0),
         "trend_30d": vals.get("trend_30d", 0.0),
-        "updated_at": datetime.datetime.utcnow().isoformat(),
+        "updated_at": run_ts,
     }
 
 
-def update_card_price(current: dict | None, card_id: str, variant: str, vals: dict) -> tuple[bool, bool, dict]:
+def update_card_price(
+    current: dict | None, card_id: str, variant: str, vals: dict, run_ts: str | None = None
+) -> tuple[bool, bool, dict]:
     """
     Compares `vals` (freshly fetched prices) against `current` (the existing
     card_prices row, or None if the variant doesn't exist yet).
@@ -527,7 +556,7 @@ def update_card_price(current: dict | None, card_id: str, variant: str, vals: di
             elif market_diff >= 0.50:
                 is_significant = True
 
-    return any_changed, is_significant, _build_price_row(card_id, variant, vals)
+    return any_changed, is_significant, _build_price_row(card_id, variant, vals, run_ts or canonical_now())
 
 
 async def _enrich_card_lore(update_row: dict, pokeapi_cache: dict[int, tuple[str, str | None]]) -> None:
@@ -554,6 +583,7 @@ def _process_card_prices(
     prices_payload: list[dict],
     new_checksums_by_key: dict[tuple[str, str], str],
     stats: dict[str, dict],
+    run_ts: str,
 ) -> tuple[int, float]:
     """Compares each price variant's checksum against the local index.
 
@@ -583,7 +613,7 @@ def _process_card_prices(
         new_checksums_by_key[(cid, variant)] = new_checksum
 
         if price_checksums.get((cid, variant)) != new_checksum:
-            prices_payload.append(_build_price_row(cid, variant, p_vals))
+            prices_payload.append(_build_price_row(cid, variant, p_vals, run_ts))
             updated += 1
             stats["variant_updates"][variant] = stats["variant_updates"].get(variant, 0) + 1
 
@@ -604,24 +634,25 @@ async def _process_price_card_result(
     new_checksums_by_key: dict[tuple[str, str], str],
     max_market_by_card: dict[str, float],
     stats: dict[str, dict],
+    run_ts: str,
 ) -> int:
     """Processes one card's TCGDex response, queuing D1 writes and local-index updates.
 
     Mutates the payload/lookup dicts in place. Returns the number of price
     variants that changed (added to `updated_count`).
 
-    updated_at is only queued when backfill content actually changes (the SQL
-    WHERE guard in chunked_update enforces this at the DB level too). Cards with
-    no data changes are not added to any D1 write payload.
+    `run_ts` is the single canonical per-run timestamp used for every row this
+    run. updated_at is only *persisted* when content actually changes (the SQL
+    WHERE guard in chunked_update/chunked_upsert enforces this at the DB level).
+    Cards with no data changes are not added to any D1 write payload.
     """
-    now_iso = datetime.datetime.utcnow().isoformat()
-    checked_at_by_card[cid] = now_iso
+    checked_at_by_card[cid] = run_ts
 
     if response.status_code == 404:
         # On 404, backfill with current DB values so the conditional UPDATE has
         # content columns to compare against (no-op if nothing changed).
         if cid in cards_by_id:
-            cards_full_payload.append({**cards_by_id[cid], "updated_at": now_iso})
+            cards_full_payload.append({**cards_by_id[cid], "updated_at": run_ts})
         # Cards not in cards_by_id have no backfill pending — skip entirely.
         return 0
 
@@ -631,7 +662,7 @@ async def _process_price_card_result(
     pricing = details.get("pricing")
     if cid in cards_by_id:
         update_row = dict(cards_by_id[cid])
-        update_row["updated_at"] = now_iso
+        update_row["updated_at"] = run_ts
         _backfill_card_fields(update_row, details)
         await _enrich_card_lore(update_row, pokeapi_cache)
         cards_full_payload.append(update_row)
@@ -642,7 +673,7 @@ async def _process_price_card_result(
         return 0
 
     updated, card_max_market = _process_card_prices(
-        cid, pricing, price_checksums, prices_payload, new_checksums_by_key, stats
+        cid, pricing, price_checksums, prices_payload, new_checksums_by_key, stats, run_ts
     )
     max_market_by_card[cid] = card_max_market
     return updated
@@ -723,7 +754,9 @@ async def sync_prices(force_prices: bool = False) -> dict:
     then kept in sync locally after every successful write.
     """
     start_time = datetime.datetime.utcnow()
-    logger.info(f"[{start_time}] Starting Price Sync (Smart Strategy)...")
+    # Single canonical server-clock instant stamped on every row touched this run.
+    run_ts = canonical_now()
+    logger.info(f"[{start_time}] Starting Price Sync (Smart Strategy)... run_ts={run_ts}")
 
     await local_index.seed_from_d1()
     rows = local_index.get_candidates()
@@ -801,6 +834,7 @@ async def sync_prices(force_prices: bool = False) -> dict:
                         new_checksums_by_key=new_checksums_by_key,
                         max_market_by_card=max_market_by_card,
                         stats=stats,
+                        run_ts=run_ts,
                     )
 
                 except Exception as e:
